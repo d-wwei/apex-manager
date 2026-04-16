@@ -73,19 +73,33 @@ export class CmuxAdapter implements TerminalAdapter {
 
   async createWindow(name: string, command: string): Promise<WindowHandle> {
     const bin = this.bin();
-    const create = run(bin, ["new-surface"]);
+
+    // Use split (visible pane next to Plan Agent) instead of new-surface (hidden tab)
+    const create = run(bin, ["new-split", "right"]);
     if (!create.ok) {
-      throw new Error(`cmux new-surface failed: ${create.stderr}`);
+      // Fallback to new-surface if split fails (e.g. no active workspace)
+      const fallback = run(bin, ["new-surface"]);
+      if (!fallback.ok) {
+        throw new Error(`cmux new-split and new-surface both failed: ${create.stderr}`);
+      }
+      const surfaceId = fallback.stdout;
+      const sendResult = run(bin, ["send", surfaceId, command]);
+      if (!sendResult.ok) {
+        throw new Error(`cmux send failed: ${sendResult.stderr}`);
+      }
+      run(bin, ["rename-tab", surfaceId, name]);
+      return { id: surfaceId, name, adapter: "cmux" };
     }
+
     const surfaceId = create.stdout;
 
-    // Send command to the new surface
-    const send = run(bin, ["send", surfaceId, command]);
-    if (!send.ok) {
-      throw new Error(`cmux send failed: ${send.stderr}`);
+    // Send command to the new split pane
+    const sendResult = run(bin, ["send", surfaceId, command]);
+    if (!sendResult.ok) {
+      throw new Error(`cmux send failed: ${sendResult.stderr}`);
     }
 
-    // Rename the tab
+    // Rename the tab for identification
     run(bin, ["rename-tab", surfaceId, name]);
 
     return { id: surfaceId, name, adapter: "cmux" };
@@ -145,6 +159,8 @@ export class CmuxAdapter implements TerminalAdapter {
 
 // --- TmuxAdapter ---
 
+const TMUX_SESSION_NAME = "apex-workers";
+
 export class TmuxAdapter implements TerminalAdapter {
   name(): string {
     return "tmux";
@@ -158,10 +174,94 @@ export class TmuxAdapter implements TerminalAdapter {
     }
   }
 
+  /** Track whether we already opened the viewer window this process. */
+  private viewerOpened = false;
+
+  /**
+   * Ensure the apex-workers tmux session exists.
+   * Called automatically when not inside a tmux session.
+   * On first call, also opens a visible Terminal.app window attached to the session.
+   */
+  private ensureSession(): void {
+    const check = run("tmux", ["has-session", "-t", TMUX_SESSION_NAME]);
+    if (!check.ok) {
+      const create = run("tmux", ["new-session", "-d", "-s", TMUX_SESSION_NAME]);
+      if (!create.ok) {
+        throw new Error(`Failed to create tmux session '${TMUX_SESSION_NAME}': ${create.stderr}`);
+      }
+    }
+
+    // Auto-open a terminal window so workers are visible (once per process)
+    if (!this.viewerOpened) {
+      this.viewerOpened = true;
+      this.openViewer();
+    }
+  }
+
+  /**
+   * Open a visible terminal window attached to the apex-workers session.
+   * Auto-detects the user's terminal emulator on macOS; skips silently on
+   * unsupported platforms or unknown terminals.
+   */
+  private openViewer(): void {
+    const attachCmd = `tmux attach -t ${TMUX_SESSION_NAME}`;
+
+    if (process.platform === "darwin") {
+      const term = process.env.TERM_PROGRAM ?? "";
+      if (term === "iTerm.app") {
+        run("osascript", ["-e",
+          `tell application "iTerm2"
+            create window with default profile command "${attachCmd}"
+          end tell`]);
+      } else {
+        // Terminal.app, Warp, or unknown — Terminal.app as safe default
+        run("osascript", ["-e",
+          `tell application "Terminal" to do script "${attachCmd}"`]);
+      }
+    } else if (process.platform === "linux") {
+      // Try common Linux terminal emulators
+      if (which("x-terminal-emulator")) {
+        run("x-terminal-emulator", ["-e", attachCmd]);
+      } else if (which("gnome-terminal")) {
+        run("gnome-terminal", ["--", "bash", "-c", attachCmd]);
+      } else if (which("xterm")) {
+        run("xterm", ["-e", attachCmd]);
+      }
+      // If none found, skip silently — user can attach manually
+    }
+    // Windows (WSL): use Windows Terminal (wt.exe) if available
+    if (process.platform === "linux" && process.env.WSL_DISTRO_NAME) {
+      if (which("wt.exe")) {
+        run("wt.exe", ["new-tab", "wsl", "--", "tmux", "attach", "-t", TMUX_SESSION_NAME]);
+      }
+      // If no wt.exe, user can run `tmux attach -t apex-workers` manually
+    }
+  }
+
   async createWindow(name: string, command: string): Promise<WindowHandle> {
-    const result = run("tmux", ["new-window", "-n", name, "-P", "-F", "#{window_id}", command]);
+    const insideTmux = !!process.env.TMUX;
+
+    let result;
+    if (insideTmux) {
+      // Inside tmux: split current window — Worker appears as a visible pane
+      // next to the Plan Agent. Use -h for horizontal split, -d to not switch focus.
+      result = run("tmux", [
+        "split-window", "-h", "-d",
+        "-P", "-F", "#{pane_id}",
+        command,
+      ]);
+      if (result.ok) {
+        // Rebalance all panes evenly after each split
+        run("tmux", ["select-layout", "tiled"]);
+      }
+    } else {
+      // Outside tmux: ensure detached session exists, create window in it
+      this.ensureSession();
+      result = run("tmux", ["new-window", "-t", TMUX_SESSION_NAME, "-n", name, "-P", "-F", "#{window_id}", command]);
+    }
+
     if (!result.ok) {
-      throw new Error(`tmux new-window failed: ${result.stderr}`);
+      throw new Error(`tmux create pane/window failed: ${result.stderr}`);
     }
     const target = result.stdout;
     return { id: target, name, adapter: "tmux" };
@@ -187,14 +287,25 @@ export class TmuxAdapter implements TerminalAdapter {
   }
 
   async close(handle: WindowHandle): Promise<void> {
-    run("tmux", ["kill-window", "-t", handle.id]);
+    // pane_id starts with %, window_id starts with @
+    if (handle.id.startsWith("%")) {
+      run("tmux", ["kill-pane", "-t", handle.id]);
+    } else {
+      run("tmux", ["kill-window", "-t", handle.id]);
+    }
   }
 
   async isAlive(handle: WindowHandle): Promise<boolean> {
-    const result = run("tmux", ["list-windows", "-F", "#{window_id}"]);
+    if (handle.id.startsWith("%")) {
+      // Pane: list all panes across all sessions
+      const result = run("tmux", ["list-panes", "-a", "-F", "#{pane_id}"]);
+      if (!result.ok) return false;
+      return result.stdout.split("\n").includes(handle.id);
+    }
+    // Window: list all windows across all sessions
+    const result = run("tmux", ["list-windows", "-a", "-F", "#{window_id}"]);
     if (!result.ok) return false;
-    const windowIds = result.stdout.split("\n");
-    return windowIds.includes(handle.id);
+    return result.stdout.split("\n").includes(handle.id);
   }
 
   async rename(handle: WindowHandle, name: string): Promise<void> {
@@ -222,9 +333,14 @@ export function detectAdapter(): TerminalAdapter {
   }
 
   // Priority 2: cmux binary available AND inside a tmux session (cmux runs atop tmux)
+  // Verify socket is actually reachable before committing to cmux.
   const cmuxAvail = which("cmux") || run(CMUX_BIN, ["--version"], 5_000).ok;
   if (cmuxAvail && process.env.TMUX) {
-    return new CmuxAdapter();
+    const ping = run(which("cmux") ? "cmux" : CMUX_BIN, ["ping"], 5_000);
+    if (ping.ok) {
+      return new CmuxAdapter();
+    }
+    // cmux socket broken — fall through to tmux
   }
 
   // Priority 3: tmux available
