@@ -18,13 +18,20 @@ import { interruptKeys as getInterruptKeys } from "./interrupt.js";
  * shell-safe prefix string like `VAR1=val VAR2=val2 `.
  * Only includes vars that exist.  Returns empty string when nothing to forward.
  */
-const AUTH_ENV_KEYS = [
-  "ANTHROPIC_API_KEY",
+/**
+ * Explicit env var names to forward, plus prefix patterns (ending with *)
+ * that match any env var starting with that prefix.
+ */
+const AUTH_ENV_ENTRIES: string[] = [
+  // Anthropic / Claude — wildcard covers AUTH_TOKEN, BASE_URL, DEFAULT_*_MODEL, etc.
+  "ANTHROPIC_*",
   "CLAUDE_API_KEY",
+  // Other AI agents
   "OPENAI_API_KEY",
   "GEMINI_API_KEY",
   "GOOGLE_API_KEY",
   "OPENROUTER_API_KEY",
+  // Proxy
   "HTTP_PROXY",
   "HTTPS_PROXY",
   "NO_PROXY",
@@ -32,8 +39,22 @@ const AUTH_ENV_KEYS = [
 
 export function buildEnvPrefix(skip?: string[]): string {
   const skipSet = new Set(skip ?? []);
+
+  // Expand wildcard entries against actual env vars
+  const keys = new Set<string>();
+  for (const entry of AUTH_ENV_ENTRIES) {
+    if (entry.endsWith("*")) {
+      const prefix = entry.slice(0, -1);
+      for (const envKey of Object.keys(process.env)) {
+        if (envKey.startsWith(prefix)) keys.add(envKey);
+      }
+    } else {
+      keys.add(entry);
+    }
+  }
+
   const parts: string[] = [];
-  for (const key of AUTH_ENV_KEYS) {
+  for (const key of keys) {
     if (skipSet.has(key)) continue;
     const val = process.env[key];
     if (val) {
