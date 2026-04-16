@@ -327,20 +327,37 @@ export class TmuxAdapter implements TerminalAdapter {
 // --- Auto-detection ---
 
 export function detectAdapter(): TerminalAdapter {
-  // Priority 1: CMUX_SURFACE env var means we're inside a cmux session
-  if (process.env.CMUX_SURFACE) {
-    return new CmuxAdapter();
+  // Priority 1: cmux env vars — any of these means we're inside a cmux session.
+  // cmux sets CMUX_PANEL_ID, CMUX_SOCKET, CMUX_WORKSPACE_ID, or CMUX_SURFACE
+  // depending on the version and context.
+  const inCmux = !!(
+    process.env.CMUX_SURFACE ||
+    process.env.CMUX_PANEL_ID ||
+    process.env.CMUX_SOCKET ||
+    process.env.CMUX_WORKSPACE_ID
+  );
+
+  if (inCmux) {
+    const adapter = new CmuxAdapter();
+    if (adapter.available()) {
+      return adapter;
+    }
+    // cmux env vars set but binary not found — warn and fall through
+    console.warn("[warn] cmux environment detected but cmux binary not found in PATH or " + CMUX_BIN);
   }
 
   // Priority 2: cmux binary available AND inside a tmux session (cmux runs atop tmux)
   // Verify socket is actually reachable before committing to cmux.
-  const cmuxAvail = which("cmux") || run(CMUX_BIN, ["--version"], 5_000).ok;
-  if (cmuxAvail && process.env.TMUX) {
-    const ping = run(which("cmux") ? "cmux" : CMUX_BIN, ["ping"], 5_000);
-    if (ping.ok) {
-      return new CmuxAdapter();
+  if (!inCmux) {
+    const cmuxAvail = which("cmux") || run(CMUX_BIN, ["--version"], 5_000).ok;
+    if (cmuxAvail && process.env.TMUX) {
+      const bin = which("cmux") ? "cmux" : CMUX_BIN;
+      const ping = run(bin, ["ping"], 5_000);
+      if (ping.ok) {
+        return new CmuxAdapter();
+      }
+      // cmux socket broken — fall through to tmux
     }
-    // cmux socket broken — fall through to tmux
   }
 
   // Priority 3: tmux available

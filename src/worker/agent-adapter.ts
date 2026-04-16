@@ -120,7 +120,7 @@ const claudeAdapter: AgentAdapter = {
   buildStartCommand(opts: StartOpts): string {
     const model = opts.model ? ` --model "${opts.model}"` : "";
     const env = buildEnvPrefix();
-    return `${env}cd "${opts.worktreePath}" && claude${model} --append-system-prompt-file "${opts.protocolPath}"`;
+    return `cd "${opts.worktreePath}" && ${env}claude${model} --append-system-prompt-file "${opts.protocolPath}"`;
   },
 };
 
@@ -212,7 +212,7 @@ const ftClaudeAdapter: AgentAdapter = {
   buildStartCommand(opts: StartOpts): string {
     const model = opts.model ? ` --model "${opts.model}"` : "";
     const env = buildEnvPrefix();
-    return `${env}cd "${opts.worktreePath}" && ft-claude${model} --append-system-prompt-file "${opts.protocolPath}"`;
+    return `cd "${opts.worktreePath}" && ${env}ft-claude${model} --append-system-prompt-file "${opts.protocolPath}"`;
   },
 };
 

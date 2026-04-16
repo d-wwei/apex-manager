@@ -50,7 +50,8 @@ async function main(): Promise<void> {
       break;
     }
     case "task": {
-      console.log("task management coming soon");
+      const { cmdTask } = await import("./commands/task.js");
+      await cmdTask(subArgs);
       break;
     }
     default: {

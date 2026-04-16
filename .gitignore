@@ -4,3 +4,8 @@ dist/
 *.js
 *.d.ts
 *.js.map
+
+# Agent Recall data
+.assistant/
+.agent-recall/
+.apex/
