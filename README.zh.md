@@ -24,7 +24,7 @@ Apex Manager 是一个 CLI 工具，基于三层架构：
 - **Daemon**（后台 Node.js 进程）—— 监控 Worker、跑测试、合并通过的分支、启动下游任务
 - **Worker**（独立终端）—— 每个 Agent 在自己的 git worktree 和终端窗口中执行任务
 
-零运行时依赖。纯 TypeScript。开箱支持 Claude、Codex、Gemini、OpenCode —— 可扩展到任何命令行 Agent。
+零运行时依赖。纯 TypeScript。开箱支持 Claude、ft-claude、Codex、Gemini、OpenCode —— 可扩展到任何命令行 Agent。Git 仓库自动使用 worktree 隔离；非 Git 项目也能用（Worker 共享项目根目录）。
 
 ## 核心特性
 

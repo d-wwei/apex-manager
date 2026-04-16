@@ -22,7 +22,7 @@ Apex Manager is a CLI tool built on a three-layer architecture:
 - **Daemon** (background Node.js process) — monitors workers, runs tests, merges passing branches, spawns dependent tasks
 - **Workers** (isolated terminals) — each agent runs in its own git worktree with its own terminal window
 
-Zero runtime dependencies. Pure TypeScript. Works with Claude, Codex, Gemini, and OpenCode — extensible to any CLI-based agent.
+Zero runtime dependencies. Pure TypeScript. Works with Claude, ft-claude, Codex, Gemini, and OpenCode out of the box — extensible to any CLI-based agent. Git repos get full worktree isolation; non-git projects work too (workers share the project root).
 
 ## Key Features
 
