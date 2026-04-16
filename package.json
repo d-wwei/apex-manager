@@ -2,17 +2,20 @@
   "name": "apex-manager",
   "version": "0.1.1",
   "type": "module",
+  "os": ["darwin", "linux"],
   "bin": {
-    "apex-manager": "src/cli.ts"
+    "apex-manager": "bin/apex-manager.sh"
   },
   "scripts": {
     "dev": "npx tsx src/cli.ts",
     "test": "node --import tsx --test tests/**/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "tsx": "^4.19.0"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "tsx": "^4.19.0",
     "typescript": "^5.7.0"
   }
 }
