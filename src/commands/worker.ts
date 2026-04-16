@@ -13,7 +13,7 @@ import { formatCostReport, formatRateLimitStatus } from "../worker/cost.js";
 import { readCostSummary, readRateLimit } from "../worker/proxy.js";
 import { loadConfig } from "../utils/config.js";
 import { checkAgent, checkAllAgents } from "../worker/capability-check.js";
-import { BUILTIN_ADAPTERS, resolveAdapterWithConfig } from "../worker/agent-adapter.js";
+import { loadAgentsConfig, resolveAdapterWithConfig } from "../worker/agent-adapter.js";
 import { interruptKeys } from "../worker/interrupt.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -95,13 +95,12 @@ async function cmdSpawn(args: string[]): Promise<void> {
   // 2. Resolve agent + adapter
   const agent = await resolveAgent(args, task);
   const isDryRun = hasFlag(args, "--dry-run");
-  let configAdapters;
-  try { configAdapters = (await loadConfig()).adapters; } catch { /* config unavailable */ }
-  const agentAdapter = resolveAdapterWithConfig(agent, configAdapters);
+  const configAgents = loadAgentsConfig();
+  const agentAdapter = resolveAdapterWithConfig(agent, configAgents);
 
   // 3. Verify agent CLI is available (skip for dry-run — no terminal will be created)
   if (!isDryRun) {
-    const binary = BUILTIN_ADAPTERS[agent]?.binary ?? agent;
+    const binary = agentAdapter.binary;
     const check = await checkAgent(binary);
     if (!check.available) {
       console.error(`Agent CLI '${binary}' not found. Install it or use --agent to specify a different agent.`);
@@ -311,7 +310,10 @@ async function cmdInterrupt(args: string[]): Promise<void> {
 
   const terminal = detectAdapter();
   const adapterName = terminal.name() as "cmux" | "tmux";
-  const keys = interruptKeys(meta.agent, adapterName);
+  // Read interrupt type from agent config; fall back to "esc" for unknown agents
+  const agentsCfg = loadAgentsConfig();
+  const interruptType = agentsCfg[meta.agent]?.interrupt ?? "esc";
+  const keys = interruptKeys(interruptType, adapterName);
 
   for (const key of keys) {
     try {
@@ -573,14 +575,16 @@ async function cmdMergeAll(args: string[]): Promise<void> {
 
 async function cmdCheck(): Promise<void> {
   const results = await checkAllAgents();
+  const agents = loadAgentsConfig();
   console.log("Agent Status:");
   for (const [name, result] of Object.entries(results)) {
-    const adapter = BUILTIN_ADAPTERS[name];
+    const adapter = resolveAdapterWithConfig(name, agents);
     const status = result.available ? "\u2713 available" : "\u2717 not found";
     const version = result.version ?? "-";
-    const injection = adapter.protocolInjection.type;
+    const protocol = adapter.protocolInjection.type === "none" && adapter.needsPostCreateSend
+      ? "post-create-send" : adapter.protocolInjection.type;
     const interrupt = adapter.interruptKeys.join(", ");
-    console.log(`  ${name.padEnd(10)} ${status.padEnd(15)} ${version.padEnd(20)} (protocol: ${injection}, interrupt: ${interrupt})`);
+    console.log(`  ${name.padEnd(10)} ${status.padEnd(15)} ${version.padEnd(20)} (protocol: ${protocol}, interrupt: ${interrupt})`);
     for (const issue of result.issues) {
       console.log(`             \u26a0 ${issue}`);
     }

@@ -1,12 +1,12 @@
 /**
  * Per-agent interrupt key sequences.
  *
- * Different AI agent CLIs respond to different key combinations.
- * Returns the keys to send (in order) to interrupt a running agent.
- *
  * Key names are adapter-specific:
  *   cmux: "escape", "ctrl-c"
  *   tmux: "Escape", "C-c"
+ *
+ * Agent interrupt type ("esc" or "ctrlc") is now defined in agents.json.
+ * This module provides the terminal-adapter key mapping.
  */
 
 type AdapterName = "cmux" | "tmux";
@@ -16,14 +16,14 @@ const KEY_MAP: Record<string, Record<AdapterName, string>> = {
   ctrlc: { cmux: "ctrl-c", tmux: "C-c" },
 };
 
-const AGENT_KEYS: Record<string, string[]> = {
-  claude:   ["esc"],
-  codex:    ["ctrlc"],
-  gemini:   ["ctrlc"],
-  opencode: ["ctrlc"],
-};
-
-export function interruptKeys(agent: string, adapter: AdapterName = "tmux"): string[] {
-  const canonical = AGENT_KEYS[agent] ?? ["esc", "ctrlc"];
+/**
+ * Map abstract interrupt key name(s) to terminal adapter-specific key strings.
+ *
+ * @param interrupt - "esc" or "ctrlc" (from agent config)
+ * @param adapter - terminal adapter name ("cmux" or "tmux")
+ */
+export function interruptKeys(interrupt: string, adapter: AdapterName = "tmux"): string[] {
+  // Accept single key or fall back to esc+ctrlc combo
+  const canonical = interrupt === "esc" ? ["esc"] : interrupt === "ctrlc" ? ["ctrlc"] : ["esc", "ctrlc"];
   return canonical.map(k => KEY_MAP[k]?.[adapter] ?? k);
 }

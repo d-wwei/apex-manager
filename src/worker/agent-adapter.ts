@@ -1,23 +1,16 @@
 /**
- * Agent adapter interface and built-in adapter registry.
+ * Agent adapter — config-driven agent registry.
  *
- * Each adapter describes how to start and interact with a specific AI
- * agent CLI (claude, codex, gemini, opencode, or custom agents defined
- * in config).  The registry centralises agent-specific knowledge that
- * was previously scattered across protocol-template.ts, interrupt.ts,
- * and cross-model.ts.
+ * Agents are defined in .apex-manager/agents.json.  Only "claude" has a
+ * built-in fallback for zero-config usage; all other agents (codex,
+ * gemini, ft-claude, custom tools) must be declared in agents.json.
  */
 
-import type { AdaptersMap } from "../types/config.js";
-import { interruptKeys as getInterruptKeys } from "./interrupt.js";
+import { existsSync, readFileSync } from "fs";
+import type { AgentEntry, AgentsMap } from "../types/config.js";
 
 // ── Env forwarding helper ───────────────────────────────────────────
 
-/**
- * Collect auth-related env vars from the current process and return a
- * shell-safe prefix string like `VAR1=val VAR2=val2 `.
- * Only includes vars that exist.  Returns empty string when nothing to forward.
- */
 /**
  * Explicit env var names to forward, plus prefix patterns (ending with *)
  * that match any env var starting with that prefix.
@@ -58,7 +51,6 @@ export function buildEnvPrefix(skip?: string[]): string {
     if (skipSet.has(key)) continue;
     const val = process.env[key];
     if (val) {
-      // Shell-safe: single-quote the value, escaping any embedded single quotes
       const escaped = val.replace(/'/g, "'\\''");
       parts.push(`${key}='${escaped}'`);
     }
@@ -94,236 +86,225 @@ export interface StartOpts {
 // ── AgentAdapter interface ───────────────────────────────────────────
 
 export interface AgentAdapter {
-  /** Canonical agent name (e.g. "claude", "codex"). */
   name: string;
-  /** Binary or command to invoke (e.g. "claude", "codex"). */
   binary: string;
-  /** Build the full shell command string to start the agent. */
   buildStartCommand(opts: StartOpts): string;
-  /** How the protocol file is injected into the agent. */
   protocolInjection: ProtocolInjectionMethod;
-  /** Agent's known capabilities. */
   capabilities: AgentCapabilities;
-  /** Raw key names for terminal sendKey (e.g. ["Escape"], ["C-c"]). */
   interruptKeys: string[];
-  /** If true, skip injecting HTTP_PROXY / HTTPS_PROXY env vars. */
   skipProxyEnv: boolean;
-  /** Whether the agent runs persistently (interactive) or exits after one execution. */
   executionMode: "persistent" | "one-shot";
-  /**
-   * If true, the protocol is injected by sending a terminal message AFTER
-   * window creation, telling the agent to read the protocol file.
-   * This is used for agents that don't support system-prompt-file or stdin pipe
-   * in interactive mode.
-   */
   needsPostCreateSend: boolean;
 }
 
-// ── Built-in adapters ────────────────────────────────────────────────
+// ── Interrupt key mapping ───────────────────────────────────────────
 
-const claudeAdapter: AgentAdapter = {
-  name: "claude",
-  binary: "claude",
-  protocolInjection: { type: "system-prompt-file", flag: "--append-system-prompt-file" },
-  interruptKeys: getInterruptKeys("claude", "tmux"),
-  skipProxyEnv: false,
-  executionMode: "persistent",
-  needsPostCreateSend: false,
-  capabilities: {
-    canExecuteBash: true,
-    canWriteFiles: true,
-    canReadFiles: true,
-    canRunApexCLI: true,
-    preferredLanguage: "zh",
-    maxPromptBytes: 1_000_000,
-    autoApprovalFlag: "--dangerously-skip-permissions",
-  },
-  buildStartCommand(opts: StartOpts): string {
-    const model = opts.model ? ` --model "${opts.model}"` : "";
-    const env = buildEnvPrefix();
-    return `cd "${opts.worktreePath}" && ${env}claude${model} --append-system-prompt-file "${opts.protocolPath}"`;
-  },
+type AdapterName = "cmux" | "tmux";
+
+const KEY_MAP: Record<string, Record<AdapterName, string>> = {
+  esc:   { cmux: "escape", tmux: "Escape" },
+  ctrlc: { cmux: "ctrl-c", tmux: "C-c" },
 };
 
-const codexAdapter: AgentAdapter = {
-  name: "codex",
-  binary: "codex",
-  protocolInjection: { type: "stdin" },
-  interruptKeys: getInterruptKeys("codex", "tmux"),
-  skipProxyEnv: true,
-  executionMode: "persistent",
-  needsPostCreateSend: true,
-  capabilities: {
-    canExecuteBash: true,
-    canWriteFiles: true,
-    canReadFiles: true,
-    canRunApexCLI: true,
-    preferredLanguage: "en",
-    maxPromptBytes: 200_000,
-    autoApprovalFlag: "--full-auto",
-  },
-  buildStartCommand(opts: StartOpts): string {
-    const model = opts.model ? ` --model "${opts.model}"` : "";
-    return `cd "${opts.worktreePath}" && codex${model} --full-auto`;
-  },
+function resolveInterruptKeys(interrupt: "esc" | "ctrlc", adapter: AdapterName = "tmux"): string[] {
+  const keys = interrupt === "esc" ? ["esc"] : ["ctrlc"];
+  return keys.map(k => KEY_MAP[k]?.[adapter] ?? k);
+}
+
+// ── Agents config ───────────────────────────────────────────────────
+
+const AGENTS_JSON_PATH = ".apex-manager/agents.json";
+
+/**
+ * Load agents.json from the project directory.
+ * Returns empty map if file does not exist.
+ */
+export function loadAgentsConfig(): AgentsMap {
+  if (!existsSync(AGENTS_JSON_PATH)) return {};
+  try {
+    const raw = readFileSync(AGENTS_JSON_PATH, "utf-8");
+    return JSON.parse(raw) as AgentsMap;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Default AgentEntry values for fields not specified by the user.
+ */
+const ENTRY_DEFAULTS: Required<Omit<AgentEntry, "command">> = {
+  args: [],
+  protocol: "post-create-send",
+  protocol_flag: "--append-system-prompt-file",
+  interrupt: "ctrlc",
+  language: "en",
+  env_forward: false,
+  skip_proxy_env: false,
+  execution_mode: "persistent",
+  auto_approval_flag: "",
 };
 
-const geminiAdapter: AgentAdapter = {
-  name: "gemini",
-  binary: "gemini",
-  protocolInjection: { type: "stdin" },
-  interruptKeys: getInterruptKeys("gemini", "tmux"),
-  skipProxyEnv: true,
-  executionMode: "persistent",
-  needsPostCreateSend: true,
-  capabilities: {
-    canExecuteBash: true,
-    canWriteFiles: true,
-    canReadFiles: true,
-    canRunApexCLI: true,
-    preferredLanguage: "en",
-    maxPromptBytes: 200_000,
-    autoApprovalFlag: "--yolo",
-  },
-  buildStartCommand(opts: StartOpts): string {
-    const model = opts.model ? ` --model "${opts.model}"` : "";
-    return `cd "${opts.worktreePath}" && gemini${model} --yolo`;
-  },
+/**
+ * The claude fallback entry — used when no agents.json exists or when
+ * "claude" is requested but not explicitly defined in config.
+ */
+const CLAUDE_FALLBACK_ENTRY: AgentEntry = {
+  command: "claude",
+  args: [],
+  protocol: "system-prompt-file",
+  protocol_flag: "--append-system-prompt-file",
+  interrupt: "esc",
+  language: "zh",
+  env_forward: true,
+  skip_proxy_env: false,
+  execution_mode: "persistent",
+  auto_approval_flag: "--dangerously-skip-permissions",
 };
 
-const opencodeAdapter: AgentAdapter = {
-  name: "opencode",
-  binary: "opencode",
-  protocolInjection: { type: "stdin" },
-  interruptKeys: getInterruptKeys("opencode", "tmux"),
-  skipProxyEnv: true,
-  executionMode: "persistent",
-  needsPostCreateSend: true,
-  capabilities: {
-    canExecuteBash: true,
-    canWriteFiles: true,
-    canReadFiles: true,
-    canRunApexCLI: true,
-    preferredLanguage: "en",
-    maxPromptBytes: 200_000,
-  },
-  buildStartCommand(opts: StartOpts): string {
-    const model = opts.model ? ` --model "${opts.model}"` : "";
-    return `cd "${opts.worktreePath}" && opencode${model}`;
-  },
-};
+// ── Build adapter from config entry ─────────────────────────────────
 
-const ftClaudeAdapter: AgentAdapter = {
-  name: "ft-claude",
-  binary: "ft-claude",
-  protocolInjection: { type: "system-prompt-file", flag: "--append-system-prompt-file" },
-  interruptKeys: getInterruptKeys("claude", "tmux"),
-  skipProxyEnv: false,
-  executionMode: "persistent",
-  needsPostCreateSend: false,
-  capabilities: {
-    canExecuteBash: true,
-    canWriteFiles: true,
-    canReadFiles: true,
-    canRunApexCLI: true,
-    preferredLanguage: "zh",
-    maxPromptBytes: 1_000_000,
-    autoApprovalFlag: "--dangerously-skip-permissions",
-  },
-  buildStartCommand(opts: StartOpts): string {
-    const model = opts.model ? ` --model "${opts.model}"` : "";
-    const env = buildEnvPrefix();
-    return `cd "${opts.worktreePath}" && ${env}ft-claude${model} --append-system-prompt-file "${opts.protocolPath}"`;
-  },
-};
+/**
+ * Construct a full AgentAdapter from a name + AgentEntry.
+ */
+export function buildAdapterFromEntry(name: string, entry: AgentEntry): AgentAdapter {
+  const protocol = entry.protocol ?? ENTRY_DEFAULTS.protocol;
+  const protocolFlag = entry.protocol_flag ?? ENTRY_DEFAULTS.protocol_flag;
+  const interrupt = entry.interrupt ?? ENTRY_DEFAULTS.interrupt;
+  const language = entry.language ?? ENTRY_DEFAULTS.language;
+  const envForward = entry.env_forward ?? ENTRY_DEFAULTS.env_forward;
+  const skipProxy = entry.skip_proxy_env ?? ENTRY_DEFAULTS.skip_proxy_env;
+  const execMode = entry.execution_mode ?? ENTRY_DEFAULTS.execution_mode;
+  const autoApproval = entry.auto_approval_flag ?? ENTRY_DEFAULTS.auto_approval_flag;
+  const args = entry.args ?? [];
 
-export const BUILTIN_ADAPTERS: Record<string, AgentAdapter> = {
-  claude: claudeAdapter,
-  "ft-claude": ftClaudeAdapter,
-  codex: codexAdapter,
-  gemini: geminiAdapter,
-  opencode: opencodeAdapter,
-};
+  let protocolInjection: ProtocolInjectionMethod;
+  let needsPostCreateSend = false;
 
-// ── Default adapter for unknown custom agents ────────────────────────
+  switch (protocol) {
+    case "system-prompt-file":
+      protocolInjection = { type: "system-prompt-file", flag: protocolFlag };
+      break;
+    case "post-create-send":
+      protocolInjection = { type: "none" };
+      needsPostCreateSend = true;
+      break;
+    default:
+      protocolInjection = { type: "none" };
+      break;
+  }
 
-function makeDefaultAdapter(name: string, command: string, args: string[]): AgentAdapter {
   return {
     name,
-    binary: command,
-    protocolInjection: { type: "none" },
-    interruptKeys: getInterruptKeys(name, "tmux"),
-    skipProxyEnv: true,
-    executionMode: "persistent",
-    needsPostCreateSend: false,
+    binary: entry.command,
+    protocolInjection,
+    interruptKeys: resolveInterruptKeys(interrupt, "tmux"),
+    skipProxyEnv: skipProxy,
+    executionMode: execMode,
+    needsPostCreateSend,
     capabilities: {
       canExecuteBash: true,
       canWriteFiles: true,
       canReadFiles: true,
-      canRunApexCLI: false,
-      preferredLanguage: "en",
-      maxPromptBytes: 200_000,
+      canRunApexCLI: true,
+      preferredLanguage: language,
+      maxPromptBytes: protocol === "system-prompt-file" ? 1_000_000 : 200_000,
+      autoApprovalFlag: autoApproval || undefined,
     },
     buildStartCommand(opts: StartOpts): string {
+      const model = opts.model ? ` --model "${opts.model}"` : "";
+      const env = envForward ? buildEnvPrefix(skipProxy ? ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"] : []) : "";
       const argsStr = args.length > 0 ? " " + args.join(" ") : "";
-      return `cd "${opts.worktreePath}" && ${command}${argsStr}`;
+      const approvalStr = autoApproval ? ` ${autoApproval}` : "";
+
+      if (protocol === "system-prompt-file") {
+        return `cd "${opts.worktreePath}" && ${env}${entry.command}${model}${argsStr} ${protocolFlag} "${opts.protocolPath}"${approvalStr}`;
+      }
+      // post-create-send or none: just start the agent
+      return `cd "${opts.worktreePath}" && ${env}${entry.command}${model}${argsStr}${approvalStr}`;
     },
   };
 }
 
-// ── Resolver: config + builtin ───────────────────────────────────────
+// ── Resolver ────────────────────────────────────────────────────────
 
 /**
- * Resolve an agent adapter with config overrides.
+ * Resolve an agent adapter.
  *
- * Priority: config override > builtin > error.
- *
- * When a config override exists for a builtin agent, the resulting
- * adapter merges: buildStartCommand from config, capabilities from
- * builtin.  For unknown custom agents, a default adapter is returned.
+ * Priority: agents.json > claude fallback > error.
  */
 export function resolveAdapterWithConfig(
   agent: string,
-  configAdapters: AdaptersMap | undefined,
+  configAgents: AgentsMap | undefined,
 ): AgentAdapter {
-  const configEntry = configAdapters?.[agent];
-  const builtin = BUILTIN_ADAPTERS[agent];
+  const entry = configAgents?.[agent];
 
-  // Case 1: config override for a builtin agent — merge
-  if (configEntry && builtin) {
-    const args = configEntry.args ?? [];
-    return {
-      ...builtin,
-      binary: configEntry.command,
-      buildStartCommand(opts: StartOpts): string {
-        const argsStr = args.length > 0 ? " " + args.join(" ") : "";
-        return `cd "${opts.worktreePath}" && ${configEntry.command}${argsStr}`;
-      },
-    };
+  // Case 1: found in config
+  if (entry) {
+    return buildAdapterFromEntry(agent, entry);
   }
 
-  // Case 2: config entry for a custom (non-builtin) agent
-  if (configEntry && !builtin) {
-    return makeDefaultAdapter(agent, configEntry.command, configEntry.args ?? []);
+  // Case 2: "claude" requested but not in config — use built-in fallback
+  if (agent === "claude") {
+    return buildAdapterFromEntry("claude", CLAUDE_FALLBACK_ENTRY);
   }
 
-  // Case 3: builtin, no config override
-  if (builtin) {
-    return builtin;
-  }
-
-  // Case 4: unknown agent, no config — error
+  // Case 3: unknown agent
+  const available = configAgents ? Object.keys(configAgents) : [];
+  if (!available.includes("claude")) available.push("claude");
   throw new Error(
-    `Unknown agent "${agent}". Add it to config.adapters or use a builtin: ${Object.keys(BUILTIN_ADAPTERS).join(", ")}`,
+    `Unknown agent "${agent}". Define it in .apex-manager/agents.json. Available: ${available.join(", ")}`,
   );
 }
 
-// ── Convenience: builtin-only lookup ─────────────────────────────────
-
 /**
- * Resolve a builtin adapter by name.  No async config loading.
- * Throws for unknown agents.
+ * Convenience: resolve using agents.json from disk.
  */
 export function resolveAdapter(agent: string): AgentAdapter {
-  return resolveAdapterWithConfig(agent, undefined);
+  return resolveAdapterWithConfig(agent, loadAgentsConfig());
 }
+
+// ── Backward compat exports ─────────────────────────────────────────
+
+/**
+ * @deprecated Use loadAgentsConfig() + resolveAdapterWithConfig() instead.
+ * Kept for callers that reference BUILTIN_ADAPTERS directly.
+ * Returns only the claude fallback.
+ */
+export const BUILTIN_ADAPTERS: Record<string, AgentAdapter> = {
+  claude: buildAdapterFromEntry("claude", CLAUDE_FALLBACK_ENTRY),
+};
+
+/**
+ * Default agent entries for `apex-manager init` to write to agents.json.
+ */
+export const DEFAULT_AGENTS: AgentsMap = {
+  claude: {
+    command: "claude",
+    protocol: "system-prompt-file",
+    protocol_flag: "--append-system-prompt-file",
+    interrupt: "esc",
+    language: "zh",
+    env_forward: true,
+    auto_approval_flag: "--dangerously-skip-permissions",
+  },
+  codex: {
+    command: "codex",
+    protocol: "post-create-send",
+    interrupt: "ctrlc",
+    language: "en",
+    auto_approval_flag: "--full-auto",
+  },
+  gemini: {
+    command: "gemini",
+    protocol: "post-create-send",
+    interrupt: "ctrlc",
+    language: "en",
+    auto_approval_flag: "--yolo",
+  },
+  opencode: {
+    command: "opencode",
+    protocol: "post-create-send",
+    interrupt: "ctrlc",
+    language: "en",
+  },
+};

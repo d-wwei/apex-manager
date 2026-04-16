@@ -1,9 +1,32 @@
-export interface AdapterEntry {
+export interface AgentEntry {
+  /** Binary or command to invoke. Required. */
   command: string;
+  /** Extra CLI arguments. */
   args?: string[];
+  /** How to inject the protocol file: "system-prompt-file" | "post-create-send" | "none". Default: "post-create-send". */
+  protocol?: "system-prompt-file" | "post-create-send" | "none";
+  /** CLI flag for system-prompt-file injection (e.g. "--append-system-prompt-file"). */
+  protocol_flag?: string;
+  /** Interrupt key type: "esc" | "ctrlc". Default: "ctrlc". */
+  interrupt?: "esc" | "ctrlc";
+  /** Preferred output language: "zh" | "en". Default: "en". */
+  language?: "zh" | "en";
+  /** Forward auth env vars (ANTHROPIC_*, etc.) to worker. Default: false. */
+  env_forward?: boolean;
+  /** Skip proxy env vars (HTTP_PROXY etc.). Default: false. */
+  skip_proxy_env?: boolean;
+  /** Execution mode. Default: "persistent". */
+  execution_mode?: "persistent" | "one-shot";
+  /** Auto-approval flag (e.g. "--dangerously-skip-permissions", "--full-auto", "--yolo"). */
+  auto_approval_flag?: string;
 }
 
-export type AdaptersMap = Record<string, AdapterEntry>;
+/** @deprecated Use AgentEntry instead */
+export type AdapterEntry = AgentEntry;
+
+export type AgentsMap = Record<string, AgentEntry>;
+/** @deprecated Use AgentsMap instead */
+export type AdaptersMap = AgentsMap;
 
 export interface ManagerConfig {
   max_concurrent_workers: number;

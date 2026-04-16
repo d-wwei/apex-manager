@@ -1,5 +1,5 @@
 import { spawnSync } from "child_process";
-import { BUILTIN_ADAPTERS } from "./agent-adapter.js";
+import { loadAgentsConfig } from "./agent-adapter.js";
 
 export interface CheckResult {
   available: boolean;     // binary exists in PATH
@@ -32,10 +32,20 @@ export async function checkAgent(binary: string): Promise<CheckResult> {
   return result;
 }
 
+/**
+ * Check all agents defined in agents.json (+ claude fallback).
+ */
 export async function checkAllAgents(): Promise<Record<string, CheckResult>> {
+  const agents = loadAgentsConfig();
+
+  // Ensure claude is always checked
+  if (!agents.claude) {
+    agents.claude = { command: "claude" };
+  }
+
   const results: Record<string, CheckResult> = {};
-  for (const [name, adapter] of Object.entries(BUILTIN_ADAPTERS)) {
-    results[name] = await checkAgent(adapter.binary);
+  for (const [name, entry] of Object.entries(agents)) {
+    results[name] = await checkAgent(entry.command);
   }
   return results;
 }

@@ -13,10 +13,8 @@
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import type { Task } from "../types/task.js";
-import { resolveAdapterWithConfig, BUILTIN_ADAPTERS } from "./agent-adapter.js";
+import { resolveAdapterWithConfig, loadAgentsConfig } from "./agent-adapter.js";
 import type { AgentCapabilities } from "./agent-adapter.js";
-import type { AdaptersMap } from "../types/config.js";
-import { loadConfig } from "../utils/config.js";
 
 // ── Public types ──────────────────────────────────────────────────────
 
@@ -75,8 +73,10 @@ function depsDisplay(deps: string[], lang: "zh" | "en"): string {
 }
 
 function getLang(agent?: string): "zh" | "en" {
-  if (agent && BUILTIN_ADAPTERS[agent]) {
-    return BUILTIN_ADAPTERS[agent].capabilities.preferredLanguage;
+  if (agent) {
+    const agents = loadAgentsConfig();
+    const adapter = resolveAdapterWithConfig(agent, agents);
+    return adapter.capabilities.preferredLanguage;
   }
   return "zh";
 }
@@ -385,21 +385,23 @@ export function sectionCommunicationForCapabilities(
 }
 
 function sectionCommunication(opts: ProtocolBuildOptions, lang: "zh" | "en"): string {
-  let caps = BUILTIN_ADAPTERS.claude.capabilities;
-  if (opts.agent && BUILTIN_ADAPTERS[opts.agent]) {
-    caps = BUILTIN_ADAPTERS[opts.agent].capabilities;
-  }
+  const agents = loadAgentsConfig();
+  const agentName = opts.agent ?? "claude";
+  const adapter = resolveAdapterWithConfig(agentName, agents);
   return sectionCommunicationForCapabilities(
     { task: opts.task, projectRoot: opts.projectRoot },
     lang,
-    caps,
+    adapter.capabilities,
   );
 }
 
 function sectionDirectiveCheck(opts: ProtocolBuildOptions, lang: "zh" | "en"): string {
   const { task, projectRoot } = opts;
   const workersDir = `${projectRoot}/.apex-manager/workers/${task.id}`;
-  const useBash = !opts.agent || (BUILTIN_ADAPTERS[opts.agent]?.capabilities.canExecuteBash ?? true);
+  const agents = loadAgentsConfig();
+  const agentName = opts.agent ?? "claude";
+  const resolvedAdapter = resolveAdapterWithConfig(agentName, agents);
+  const useBash = resolvedAdapter.capabilities.canExecuteBash;
 
   const escalationJson = `{ "task_id": "${task.id}", "type": "human_intervention", "stage": "<current_stage>", "summary": "${lang === "en" ? "Human user directly operated the terminal" : "人类用户直接操作了终端"}", "created_at": "<ISO timestamp>" }`;
 
@@ -606,15 +608,8 @@ export function generateWorkerProtocol(opts: ProtocolBuildOptions): string {
 // ── Agent start command ──────────────────────────────────────────────
 
 export async function agentStartCommand(agent: string, worktreePath: string): Promise<string> {
-  let configAdapters: AdaptersMap = {};
-  try {
-    const config = await loadConfig();
-    if (config.adapters) {
-      configAdapters = config.adapters;
-    }
-  } catch { /* config unavailable */ }
-
-  const adapter = resolveAdapterWithConfig(agent, configAdapters);
+  const agents = loadAgentsConfig();
+  const adapter = resolveAdapterWithConfig(agent, agents);
   return adapter.buildStartCommand({
     worktreePath,
     protocolPath: ".apex-manager/worker-protocol.md",
