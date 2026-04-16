@@ -14,9 +14,9 @@ import type { AdaptersMap } from "../../src/types/config.js";
 // ── BUILTIN_ADAPTERS registry ────────────────────────────────────────
 
 describe("BUILTIN_ADAPTERS", () => {
-  it("has exactly 4 entries: claude, codex, gemini, opencode", () => {
+  it("has exactly 5 entries: claude, codex, ft-claude, gemini, opencode", () => {
     const keys = Object.keys(BUILTIN_ADAPTERS).sort();
-    assert.deepStrictEqual(keys, ["claude", "codex", "gemini", "opencode"]);
+    assert.deepStrictEqual(keys, ["claude", "codex", "ft-claude", "gemini", "opencode"]);
   });
 
   it("every adapter has all required fields", () => {
@@ -48,28 +48,28 @@ describe("buildStartCommand", () => {
     assert.ok(cmd.includes(baseOpts.protocolPath));
   });
 
-  it("codex: pipes cat protocol into codex exec --full-auto", () => {
+  it("codex: starts interactive mode with --full-auto", () => {
     const cmd = BUILTIN_ADAPTERS.codex.buildStartCommand(baseOpts);
-    assert.ok(cmd.includes("cat"));
-    assert.ok(cmd.includes(baseOpts.protocolPath));
     assert.ok(cmd.includes("codex"));
     assert.ok(cmd.includes("--full-auto"));
+    // Interactive mode: no exec subcommand, no cat pipe
+    assert.ok(!cmd.includes("exec"));
   });
 
-  it("gemini: uses --yolo and single-quoted cat path", () => {
+  it("gemini: starts interactive mode with --yolo", () => {
     const cmd = BUILTIN_ADAPTERS.gemini.buildStartCommand(baseOpts);
     assert.ok(cmd.includes("gemini"));
     assert.ok(cmd.includes("--yolo"));
-    assert.ok(cmd.includes("-p"));
-    // single-quoted cat path
-    assert.ok(cmd.includes(`$(cat '${baseOpts.protocolPath}')`));
+    // Interactive mode: no -p flag
+    assert.ok(!cmd.includes("-p"));
   });
 
-  it("opencode: uses run -p with single-quoted cat path", () => {
+  it("opencode: starts interactive mode", () => {
     const cmd = BUILTIN_ADAPTERS.opencode.buildStartCommand(baseOpts);
     assert.ok(cmd.includes("opencode"));
-    assert.ok(cmd.includes("run -p"));
-    assert.ok(cmd.includes(`$(cat '${baseOpts.protocolPath}')`));
+    // Interactive mode: no run subcommand, no -p
+    assert.ok(!cmd.includes("run"));
+    assert.ok(!cmd.includes("-p"));
   });
 
   it("all commands include cd to worktreePath", () => {
@@ -157,18 +157,12 @@ describe("protocolInjection", () => {
     assert.deepStrictEqual(BUILTIN_ADAPTERS.codex.protocolInjection, { type: "stdin" });
   });
 
-  it("gemini uses cli-argument with -p flag", () => {
-    assert.deepStrictEqual(BUILTIN_ADAPTERS.gemini.protocolInjection, {
-      type: "cli-argument",
-      flag: "-p",
-    });
+  it("gemini uses stdin (post-create send)", () => {
+    assert.deepStrictEqual(BUILTIN_ADAPTERS.gemini.protocolInjection, { type: "stdin" });
   });
 
-  it("opencode uses cli-argument with -p flag", () => {
-    assert.deepStrictEqual(BUILTIN_ADAPTERS.opencode.protocolInjection, {
-      type: "cli-argument",
-      flag: "-p",
-    });
+  it("opencode uses stdin (post-create send)", () => {
+    assert.deepStrictEqual(BUILTIN_ADAPTERS.opencode.protocolInjection, { type: "stdin" });
   });
 });
 

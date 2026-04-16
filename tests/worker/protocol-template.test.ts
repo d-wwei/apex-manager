@@ -194,25 +194,26 @@ describe("agentStartCommand", () => {
     assert.ok(cmd.includes(worktree));
   });
 
-  it("returns codex command with stdin pipe and exec --full-auto", async () => {
+  it("returns codex command with interactive --full-auto", async () => {
     const cmd = await agentStartCommand("codex", worktree);
-    assert.ok(cmd.includes("cat"));
     assert.ok(cmd.includes("codex"));
-    assert.ok(cmd.includes("exec --full-auto"));
+    assert.ok(cmd.includes("--full-auto"));
+    assert.ok(!cmd.includes("exec"), "should not use one-shot exec mode");
     assert.ok(cmd.includes(worktree));
   });
 
-  it("returns gemini command with single-quoted protocol path", async () => {
+  it("returns gemini command with interactive --yolo", async () => {
     const cmd = await agentStartCommand("gemini", worktree);
     assert.ok(cmd.includes("gemini"));
-    assert.ok(cmd.includes("'"));
+    assert.ok(cmd.includes("--yolo"));
+    assert.ok(!cmd.includes("-p"), "should not use one-shot -p flag");
     assert.ok(cmd.includes(worktree));
   });
 
-  it("returns opencode command with run -p", async () => {
+  it("returns opencode command in interactive mode", async () => {
     const cmd = await agentStartCommand("opencode", worktree);
     assert.ok(cmd.includes("opencode"));
-    assert.ok(cmd.includes("run -p"));
+    assert.ok(!cmd.includes("run"), "should not use run subcommand");
     assert.ok(cmd.includes(worktree));
   });
 

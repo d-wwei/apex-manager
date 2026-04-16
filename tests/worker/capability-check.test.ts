@@ -38,14 +38,15 @@ describe("checkAllAgents", () => {
   // checkAllAgents runs 4 agents sequentially; some CLIs (e.g. claude) take
   // ~5 s to respond to --version, so allow enough wall time for the full pass.
 
-  it("returns entries for all 4 builtin agents", { timeout: 30_000 }, async () => {
+  it("returns entries for all 5 builtin agents", { timeout: 30_000 }, async () => {
     const results = await checkAllAgents();
     const keys = Object.keys(results);
     assert.ok(keys.includes("claude"));
+    assert.ok(keys.includes("ft-claude"));
     assert.ok(keys.includes("codex"));
     assert.ok(keys.includes("gemini"));
     assert.ok(keys.includes("opencode"));
-    assert.strictEqual(keys.length, 4);
+    assert.strictEqual(keys.length, 5);
   });
 
   it("each result has correct shape", { timeout: 30_000 }, async () => {

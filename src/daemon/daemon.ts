@@ -25,7 +25,7 @@ import type { TaskStore } from "../types/task.js";
 export interface WorkerState {
   taskId: string;
   meta: WorkerMeta;
-  lastHealth: { alive: boolean; completed: boolean; crashed: boolean };
+  lastHealth: { alive: boolean; completed: boolean; crashed: boolean; exitedWithoutResult: boolean };
   resultChecked: boolean;
 }
 
@@ -89,7 +89,7 @@ export async function discoverWorkers(state: DaemonState): Promise<void> {
     state.workers.set(taskId, {
       taskId,
       meta,
-      lastHealth: { alive: !hasResult, completed: hasResult, crashed: false },
+      lastHealth: { alive: !hasResult, completed: hasResult, crashed: false, exitedWithoutResult: false },
       resultChecked: false, // tick will process on next cycle
     });
 
@@ -159,6 +159,18 @@ export async function tick(state: DaemonState): Promise<void> {
       worker.resultChecked = true; // Don't re-report
     }
 
+    // 3b. Detect one-shot agent exit without result (not a crash)
+    if (health.exitedWithoutResult && !worker.resultChecked) {
+      await notifyPlanAgent(state.adapter, state.planAgentHandle,
+        `Worker ${taskId} (one-shot) exited without writing result.json. Agent may have failed silently or lacked permissions.`);
+      appendJSONL(".apex-manager/event-log.jsonl", {
+        type: "orchestration.event",
+        action: "worker_exited_no_result", task: taskId,
+        timestamp: new Date().toISOString(),
+      });
+      worker.resultChecked = true;
+    }
+
     // 4. Detect escalation
     const escPath = join(state.projectRoot, ".apex-manager", "workers", taskId, "escalation.json");
     if (existsSync(escPath)) {
@@ -178,7 +190,7 @@ export async function tick(state: DaemonState): Promise<void> {
       }
     }
 
-    worker.lastHealth = { alive: health.alive, completed: health.completed, crashed: health.crashed };
+    worker.lastHealth = { alive: health.alive, completed: health.completed, crashed: health.crashed, exitedWithoutResult: health.exitedWithoutResult };
   }
 
   // 5. Spawn unblocked tasks
@@ -221,7 +233,7 @@ async function spawnUnblockedTasks(state: DaemonState): Promise<void> {
         state.workers.set(task.id, {
           taskId: task.id,
           meta,
-          lastHealth: { alive: true, completed: false, crashed: false },
+          lastHealth: { alive: true, completed: false, crashed: false, exitedWithoutResult: false },
           resultChecked: false,
         });
       }

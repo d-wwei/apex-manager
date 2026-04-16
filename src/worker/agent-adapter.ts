@@ -11,6 +11,40 @@
 import type { AdaptersMap } from "../types/config.js";
 import { interruptKeys as getInterruptKeys } from "./interrupt.js";
 
+// ── Env forwarding helper ───────────────────────────────────────────
+
+/**
+ * Collect auth-related env vars from the current process and return a
+ * shell-safe prefix string like `VAR1=val VAR2=val2 `.
+ * Only includes vars that exist.  Returns empty string when nothing to forward.
+ */
+const AUTH_ENV_KEYS = [
+  "ANTHROPIC_API_KEY",
+  "CLAUDE_API_KEY",
+  "OPENAI_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "OPENROUTER_API_KEY",
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "NO_PROXY",
+];
+
+export function buildEnvPrefix(skip?: string[]): string {
+  const skipSet = new Set(skip ?? []);
+  const parts: string[] = [];
+  for (const key of AUTH_ENV_KEYS) {
+    if (skipSet.has(key)) continue;
+    const val = process.env[key];
+    if (val) {
+      // Shell-safe: single-quote the value, escaping any embedded single quotes
+      const escaped = val.replace(/'/g, "'\\''");
+      parts.push(`${key}='${escaped}'`);
+    }
+  }
+  return parts.length > 0 ? parts.join(" ") + " " : "";
+}
+
 // ── Supporting types ─────────────────────────────────────────────────
 
 export type ProtocolInjectionMethod =
@@ -53,6 +87,15 @@ export interface AgentAdapter {
   interruptKeys: string[];
   /** If true, skip injecting HTTP_PROXY / HTTPS_PROXY env vars. */
   skipProxyEnv: boolean;
+  /** Whether the agent runs persistently (interactive) or exits after one execution. */
+  executionMode: "persistent" | "one-shot";
+  /**
+   * If true, the protocol is injected by sending a terminal message AFTER
+   * window creation, telling the agent to read the protocol file.
+   * This is used for agents that don't support system-prompt-file or stdin pipe
+   * in interactive mode.
+   */
+  needsPostCreateSend: boolean;
 }
 
 // ── Built-in adapters ────────────────────────────────────────────────
@@ -63,6 +106,8 @@ const claudeAdapter: AgentAdapter = {
   protocolInjection: { type: "system-prompt-file", flag: "--append-system-prompt-file" },
   interruptKeys: getInterruptKeys("claude", "tmux"),
   skipProxyEnv: false,
+  executionMode: "persistent",
+  needsPostCreateSend: false,
   capabilities: {
     canExecuteBash: true,
     canWriteFiles: true,
@@ -74,7 +119,8 @@ const claudeAdapter: AgentAdapter = {
   },
   buildStartCommand(opts: StartOpts): string {
     const model = opts.model ? ` --model "${opts.model}"` : "";
-    return `cd "${opts.worktreePath}" && claude${model} --append-system-prompt-file "${opts.protocolPath}"`;
+    const env = buildEnvPrefix();
+    return `${env}cd "${opts.worktreePath}" && claude${model} --append-system-prompt-file "${opts.protocolPath}"`;
   },
 };
 
@@ -84,6 +130,8 @@ const codexAdapter: AgentAdapter = {
   protocolInjection: { type: "stdin" },
   interruptKeys: getInterruptKeys("codex", "tmux"),
   skipProxyEnv: true,
+  executionMode: "persistent",
+  needsPostCreateSend: true,
   capabilities: {
     canExecuteBash: true,
     canWriteFiles: true,
@@ -95,16 +143,18 @@ const codexAdapter: AgentAdapter = {
   },
   buildStartCommand(opts: StartOpts): string {
     const model = opts.model ? ` --model "${opts.model}"` : "";
-    return `cd "${opts.worktreePath}" && cat "${opts.protocolPath}" | codex${model} exec --full-auto`;
+    return `cd "${opts.worktreePath}" && codex${model} --full-auto`;
   },
 };
 
 const geminiAdapter: AgentAdapter = {
   name: "gemini",
   binary: "gemini",
-  protocolInjection: { type: "cli-argument", flag: "-p" },
+  protocolInjection: { type: "stdin" },
   interruptKeys: getInterruptKeys("gemini", "tmux"),
   skipProxyEnv: true,
+  executionMode: "persistent",
+  needsPostCreateSend: true,
   capabilities: {
     canExecuteBash: true,
     canWriteFiles: true,
@@ -116,16 +166,18 @@ const geminiAdapter: AgentAdapter = {
   },
   buildStartCommand(opts: StartOpts): string {
     const model = opts.model ? ` --model "${opts.model}"` : "";
-    return `cd "${opts.worktreePath}" && gemini${model} --yolo -p "$(cat '${opts.protocolPath}')"`;
+    return `cd "${opts.worktreePath}" && gemini${model} --yolo`;
   },
 };
 
 const opencodeAdapter: AgentAdapter = {
   name: "opencode",
   binary: "opencode",
-  protocolInjection: { type: "cli-argument", flag: "-p" },
+  protocolInjection: { type: "stdin" },
   interruptKeys: getInterruptKeys("opencode", "tmux"),
   skipProxyEnv: true,
+  executionMode: "persistent",
+  needsPostCreateSend: true,
   capabilities: {
     canExecuteBash: true,
     canWriteFiles: true,
@@ -136,12 +188,37 @@ const opencodeAdapter: AgentAdapter = {
   },
   buildStartCommand(opts: StartOpts): string {
     const model = opts.model ? ` --model "${opts.model}"` : "";
-    return `cd "${opts.worktreePath}" && opencode${model} run -p "$(cat '${opts.protocolPath}')"`;
+    return `cd "${opts.worktreePath}" && opencode${model}`;
+  },
+};
+
+const ftClaudeAdapter: AgentAdapter = {
+  name: "ft-claude",
+  binary: "ft-claude",
+  protocolInjection: { type: "system-prompt-file", flag: "--append-system-prompt-file" },
+  interruptKeys: getInterruptKeys("claude", "tmux"),
+  skipProxyEnv: false,
+  executionMode: "persistent",
+  needsPostCreateSend: false,
+  capabilities: {
+    canExecuteBash: true,
+    canWriteFiles: true,
+    canReadFiles: true,
+    canRunApexCLI: true,
+    preferredLanguage: "zh",
+    maxPromptBytes: 1_000_000,
+    autoApprovalFlag: "--dangerously-skip-permissions",
+  },
+  buildStartCommand(opts: StartOpts): string {
+    const model = opts.model ? ` --model "${opts.model}"` : "";
+    const env = buildEnvPrefix();
+    return `${env}cd "${opts.worktreePath}" && ft-claude${model} --append-system-prompt-file "${opts.protocolPath}"`;
   },
 };
 
 export const BUILTIN_ADAPTERS: Record<string, AgentAdapter> = {
   claude: claudeAdapter,
+  "ft-claude": ftClaudeAdapter,
   codex: codexAdapter,
   gemini: geminiAdapter,
   opencode: opencodeAdapter,
@@ -156,6 +233,8 @@ function makeDefaultAdapter(name: string, command: string, args: string[]): Agen
     protocolInjection: { type: "none" },
     interruptKeys: getInterruptKeys(name, "tmux"),
     skipProxyEnv: true,
+    executionMode: "persistent",
+    needsPostCreateSend: false,
     capabilities: {
       canExecuteBash: true,
       canWriteFiles: true,

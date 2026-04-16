@@ -37,6 +37,8 @@ export interface WorkerMeta {
   branch: string;
   started_at: string;
   agent: string;
+  /** "persistent" agents stay alive; "one-shot" agents exit after execution. */
+  execution_mode?: "persistent" | "one-shot";
 }
 
 export interface WorkerHealth {
@@ -44,6 +46,8 @@ export interface WorkerHealth {
   stale: boolean;
   completed: boolean;
   crashed: boolean;
+  /** Terminal exited without writing result.json (one-shot agents or silent failures). */
+  exitedWithoutResult: boolean;
   screenTail?: string;
 }
 
@@ -145,11 +149,15 @@ export async function checkWorkerHealth(taskId: string): Promise<WorkerHealth> {
     stale = age > STALE_THRESHOLD_MS;
   }
 
-  // Crashed: had a PID or terminal but neither is alive, and no result
+  // Crashed vs exited-without-result: both have no terminal and no result.
+  // Distinguish by execution_mode: one-shot agents are expected to exit.
   const hadProcess = meta.pid !== undefined || meta.window_handle !== null;
-  const crashed = hadProcess && !alive && !completed;
+  const processGone = hadProcess && !alive && !completed;
+  const isOneShot = meta.execution_mode === "one-shot";
+  const crashed = processGone && !isOneShot;
+  const exitedWithoutResult = processGone && isOneShot;
 
-  return { alive, stale, completed, crashed, screenTail };
+  return { alive, stale, completed, crashed, exitedWithoutResult, screenTail };
 }
 
 // ── getMonitorReport ───────────────────────────────────────────────
@@ -168,6 +176,8 @@ export async function getMonitorReport(): Promise<string> {
       label = `completed (${w.result?.verdict ?? "unknown"})`;
     } else if (health.crashed) {
       label = "CRASHED";
+    } else if (health.exitedWithoutResult) {
+      label = "EXITED (no result)";
     } else if (health.stale) {
       label = "STALE";
     } else if (health.alive) {

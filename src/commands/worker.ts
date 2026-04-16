@@ -13,7 +13,7 @@ import { formatCostReport, formatRateLimitStatus } from "../worker/cost.js";
 import { readCostSummary, readRateLimit } from "../worker/proxy.js";
 import { loadConfig } from "../utils/config.js";
 import { checkAgent, checkAllAgents } from "../worker/capability-check.js";
-import { BUILTIN_ADAPTERS } from "../worker/agent-adapter.js";
+import { BUILTIN_ADAPTERS, resolveAdapterWithConfig } from "../worker/agent-adapter.js";
 import { interruptKeys } from "../worker/interrupt.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -92,9 +92,12 @@ async function cmdSpawn(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // 2. Resolve agent
+  // 2. Resolve agent + adapter
   const agent = await resolveAgent(args, task);
   const isDryRun = hasFlag(args, "--dry-run");
+  let configAdapters;
+  try { configAdapters = (await loadConfig()).adapters; } catch { /* config unavailable */ }
+  const agentAdapter = resolveAdapterWithConfig(agent, configAdapters);
 
   // 3. Verify agent CLI is available (skip for dry-run — no terminal will be created)
   if (!isDryRun) {
@@ -112,23 +115,40 @@ async function cmdSpawn(args: string[]): Promise<void> {
     }
   }
 
-  // 4. Create git worktree
+  // 4. Create git worktree (or use project root for non-git repos)
   const projectRoot = process.cwd();
-  const worktreeRel = `.apex-manager/worktrees/${taskId}`;
-  const worktreePath = resolve(projectRoot, worktreeRel);
-  const branch = `apex-mgr/${taskId}`;
+  const isGitRepo = spawnSync("git", ["rev-parse", "--git-dir"], { cwd: projectRoot, encoding: "utf-8" }).status === 0;
 
-  if (!existsSync(worktreePath)) {
-    // Try with -b (new branch)
-    let result = spawnSync("git", ["worktree", "add", worktreeRel, "-b", branch]);
-    if (result.status !== 0) {
-      // Branch may already exist -- try without -b
-      result = spawnSync("git", ["worktree", "add", worktreeRel, branch]);
+  let worktreeRel: string;
+  let worktreePath: string;
+  let branch: string;
+  let isolated: boolean;
+
+  if (isGitRepo) {
+    worktreeRel = `.apex-manager/worktrees/${taskId}`;
+    worktreePath = resolve(projectRoot, worktreeRel);
+    branch = `apex-mgr/${taskId}`;
+    isolated = true;
+
+    if (!existsSync(worktreePath)) {
+      // Try with -b (new branch)
+      let result = spawnSync("git", ["worktree", "add", worktreeRel, "-b", branch]);
       if (result.status !== 0) {
-        // Fall back to mkdir
-        mkdirSync(worktreePath, { recursive: true });
+        // Branch may already exist -- try without -b
+        result = spawnSync("git", ["worktree", "add", worktreeRel, branch]);
+        if (result.status !== 0) {
+          console.error(`Failed to create git worktree for ${taskId}. Check git status.`);
+          process.exit(1);
+        }
       }
     }
+  } else {
+    // Non-git repo: no worktree isolation, work directly in project root
+    console.warn(`[warn] Not a git repository — worker will run in project root (no isolation)`);
+    worktreeRel = ".";
+    worktreePath = projectRoot;
+    branch = "";
+    isolated = false;
   }
 
   // 5. Initialize worktree
@@ -151,6 +171,7 @@ async function cmdSpawn(args: string[]): Promise<void> {
     completedDeps,
     crossModel,
     agent,
+    isolated,
   };
 
   const protocol = buildWorkerProtocol(opts);
@@ -168,6 +189,7 @@ async function cmdSpawn(args: string[]): Promise<void> {
     branch,
     started_at: new Date().toISOString(),
     agent,
+    execution_mode: agentAdapter.executionMode,
   };
 
   await writeJSON(join(workersDir, "meta.json"), meta);
@@ -185,14 +207,22 @@ async function cmdSpawn(args: string[]): Promise<void> {
   const windowName = `${taskId}-${slug}`;
   const command = await agentStartCommand(agent, worktreePath);
 
-  const adapter = detectAdapter();
-  const handle = await adapter.createWindow(windowName, command);
+  const terminal = detectAdapter();
+  const handle = await terminal.createWindow(windowName, command);
 
-  // 9. Update meta with window handle
+  // 9. Post-create protocol injection for agents that need it
+  if (agentAdapter.needsPostCreateSend) {
+    // Wait for agent CLI to start, then send the protocol read instruction
+    await new Promise((r) => setTimeout(r, 3000));
+    const relProtocol = ".apex-manager/worker-protocol.md";
+    await terminal.send(handle, `Read the file ${relProtocol} and execute all tasks described in it. This is your complete work instruction.`);
+  }
+
+  // 10. Update meta with window handle
   meta.window_handle = handle;
   await writeJSON(join(workersDir, "meta.json"), meta);
 
-  // 10. Print confirmation
+  // 11. Print confirmation
   console.log(`Worker ${taskId} spawned in window ${windowName} (agent: ${agent}, worktree: ${worktreeRel})`);
 }
 
@@ -233,10 +263,12 @@ async function cmdKill(args: string[]): Promise<void> {
     }
   }
 
-  // 3. Clean up worktree
-  const worktreeRel = `.apex-manager/worktrees/${taskId}`;
-  spawnSync("git", ["worktree", "remove", worktreeRel, "--force"]);
-  spawnSync("git", ["branch", "-D", `apex-mgr/${taskId}`]);
+  // 3. Clean up worktree (skip for non-git workers)
+  if (meta.branch) {
+    const worktreeRel = meta.worktree_path || `.apex-manager/worktrees/${taskId}`;
+    spawnSync("git", ["worktree", "remove", worktreeRel, "--force"]);
+    spawnSync("git", ["branch", "-D", meta.branch]);
+  }
 
   // 4. Remove worker directory
   const workersDir = join(projectRoot, ".apex-manager", "workers", taskId);
@@ -409,6 +441,10 @@ export async function cmdMerge(args: string[]): Promise<void> {
   }
   const meta: WorkerMeta = JSON.parse(readFileSync(metaPath, "utf-8"));
   const branch = meta.branch;
+  if (!branch) {
+    console.error(`Cannot merge ${taskId}: worker was not isolated in a git worktree (non-git project).`);
+    process.exit(1);
+  }
   const worktreePath = resolve(projectRoot, meta.worktree_path);
 
   // 3. Read task title from tasks.json
@@ -617,6 +653,7 @@ export async function cmdWorker(args: string[]): Promise<void> {
         let status: string;
         if (health.completed) status = "completed";
         else if (health.crashed) status = "CRASHED";
+        else if (health.exitedWithoutResult) status = "EXITED (no result)";
         else if (health.stale) status = "STALE";
         else if (health.alive) status = "running";
         else status = "unknown";
@@ -652,6 +689,7 @@ export async function cmdWorker(args: string[]): Promise<void> {
       let statusLabel: string;
       if (health.completed) statusLabel = "completed";
       else if (health.crashed) statusLabel = "CRASHED";
+      else if (health.exitedWithoutResult) statusLabel = "EXITED (no result)";
       else if (health.stale) statusLabel = "STALE";
       else if (health.alive) statusLabel = "running";
       else statusLabel = "unknown";

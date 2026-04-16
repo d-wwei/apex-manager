@@ -28,6 +28,8 @@ export interface ProtocolBuildOptions {
   agent?: string;
   protocol?: string;       // skill name (e.g. "apex-forge", "great-writer")
   crossModel?: boolean;
+  /** false when running in a non-git repo without worktree isolation */
+  isolated?: boolean;
 }
 
 // ── Skill lookup ─────────────────────────────────────────────────────
@@ -486,6 +488,25 @@ ${directiveCheckBlock}
 
 function sectionBoundaries(opts: ProtocolBuildOptions, lang: "zh" | "en"): string {
   const { task } = opts;
+  const isolated = opts.isolated !== false; // default true for backward compat
+
+  if (!isolated) {
+    // Non-git repo: no worktree isolation, simpler boundaries
+    if (lang === "en") {
+      return `\
+## Work Boundaries
+
+- Only modify files relevant to your task
+- **Do NOT** modify other Workers' files or state
+- **Do NOT** modify .apex-manager/ control files except status/result/escalation`;
+    }
+    return `\
+## 工作边界
+
+- 只修改与你的任务相关的文件
+- **不要**修改其他 Worker 的文件或状态
+- **不要**修改 .apex-manager/ 控制文件（status/result/escalation 除外）`;
+  }
 
   if (lang === "en") {
     return `\
