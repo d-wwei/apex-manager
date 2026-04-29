@@ -261,4 +261,46 @@ esac
     assert.ok(log.includes("read-screen surface-9 --lines 20"));
     assert.ok(log.includes("send surface-9 [PLAN-AGENT]"));
   });
+
+  it("allocates unique message IDs under concurrent sends", async () => {
+    const sent: string[] = [];
+    const { sendStructuredMessage, listMessages } = await import("../../src/worker/messages.js");
+
+    const [first, second] = await Promise.all([
+      sendStructuredMessage({
+        from: "manager",
+        to: "T1",
+        taskId: "T1",
+        kind: "directive",
+        body: "First concurrent message.",
+        directiveAction: "info",
+        adapter: makeFakeAdapter(sent),
+      }),
+      sendStructuredMessage({
+        from: "manager",
+        to: "T1",
+        taskId: "T1",
+        kind: "directive",
+        body: "Second concurrent message.",
+        directiveAction: "info",
+        adapter: makeFakeAdapter(sent),
+      }),
+    ]);
+
+    assert.notStrictEqual(first.id, second.id);
+    assert.deepStrictEqual(
+      [first.id, second.id].sort(),
+      ["MSG-1", "MSG-2"],
+    );
+
+    const store = JSON.parse(readFileSync(join(tmpDir, ".apex-manager", "messages", "index.json"), "utf-8"));
+    assert.strictEqual(store.next_id, 3);
+    assert.deepStrictEqual(
+      store.messages.map((message: { id: string }) => message.id).sort(),
+      ["MSG-1", "MSG-2"],
+    );
+
+    const listed = await listMessages({ to: "T1" });
+    assert.strictEqual(listed.length, 2);
+  });
 });

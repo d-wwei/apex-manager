@@ -11,7 +11,7 @@
  */
 
 import { existsSync, readFileSync } from "fs";
-import { join } from "path";
+import { basename, join } from "path";
 import type { Task } from "../types/task.js";
 import { resolveAdapterWithConfig, loadAgentsConfig } from "./agent-adapter.js";
 import type { AgentCapabilities } from "./agent-adapter.js";
@@ -28,6 +28,10 @@ export interface ProtocolBuildOptions {
   crossModel?: boolean;
   /** false when running in a non-git repo without worktree isolation */
   isolated?: boolean;
+}
+
+export function workerProtocolRelativePath(taskId: string): string {
+  return `.apex-manager/workers/${taskId}/worker-protocol.md`;
 }
 
 // ── Skill lookup ─────────────────────────────────────────────────────
@@ -632,11 +636,15 @@ export function generateWorkerProtocol(opts: ProtocolBuildOptions): string {
 
 // ── Agent start command ──────────────────────────────────────────────
 
-export async function agentStartCommand(agent: string, worktreePath: string): Promise<string> {
+export async function agentStartCommand(
+  agent: string,
+  worktreePath: string,
+  protocolPath = workerProtocolRelativePath(basename(worktreePath)),
+): Promise<string> {
   const agents = loadAgentsConfig();
   const adapter = resolveAdapterWithConfig(agent, agents);
   return adapter.buildStartCommand({
     worktreePath,
-    protocolPath: ".apex-manager/worker-protocol.md",
+    protocolPath,
   });
 }

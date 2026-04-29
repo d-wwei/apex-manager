@@ -22,7 +22,7 @@ Apex Manager is a CLI tool built on a three-layer architecture:
 - **Daemon** (background Node.js process) — monitors workers, runs tests, merges passing branches, spawns dependent tasks
 - **Workers** (isolated terminals) — each agent runs in its own git worktree with its own terminal window
 
-Zero runtime dependencies. Pure TypeScript. Works with Claude, ft-claude, Codex, Gemini, and OpenCode out of the box — extensible to any CLI-based agent. Git repos get full worktree isolation; non-git projects work too (workers share the project root).
+Zero runtime dependencies. Pure TypeScript. Works with Claude, ft-claude, Codex, Gemini, and OpenCode out of the box — extensible to any CLI-based agent. Git repos get full worktree isolation; non-git projects degrade explicitly to shared project-root mode (workers share the same directory, so parallel edits can conflict).
 
 ## Key Features
 
@@ -33,6 +33,8 @@ Zero runtime dependencies. Pure TypeScript. Works with Claude, ft-claude, Codex,
 - **Multi-agent heterogeneity.** Assign Claude to architecture, Codex to implementation, Gemini to security review — in the same workflow. Agent-specific adapters handle the differences: binary paths, interrupt keys, protocol injection methods, capability profiles.
 
 - **Skill/protocol injection.** Before a worker starts, Apex Manager discovers relevant skills from your agent's skill directory and injects them as work instructions. A worker doesn't just get a task — it gets a methodology.
+
+- **Per-worker protocol files and launch verification.** Each worker gets its own protocol file under `.apex-manager/workers/<task-id>/worker-protocol.md`, with a runtime copy inside its worktree. Spawn is only treated as successful after real activity appears within the verification window — not just because a prompt became visible.
 
 - **Cross-model consensus.** Run the same task through multiple agents with `--cross-model`. Results are synthesized and deduplicated. For security audits, architecture reviews, or anything where a second opinion costs less than a missed bug.
 
@@ -89,6 +91,8 @@ No layer does another layer's job. Workers can't orchestrate. The daemon can't m
 apex-manager init
 apex-manager worker spawn T1 --agent claude --protocol apex-forge
 apex-manager worker spawn T2 --agent codex
+apex-manager worker status T1
+apex-manager worker status T2
 apex-manager orch start
 ```
 
@@ -138,6 +142,7 @@ All state flows through `.apex-manager/`:
 ├── workers/
 │   └── T1/
 │       ├── meta.json        # Worktree path, branch, agent type
+│       ├── worker-protocol.md # Canonical control-plane copy of this worker's protocol
 │       ├── status.json      # Worker's progress updates
 │       ├── result.json      # Final verdict: pass / fail / blocked
 │       ├── escalation.json  # Worker → Plan Agent questions

@@ -52,6 +52,8 @@ describe("buildStartCommand", () => {
     const cmd = BUILTIN_ADAPTERS.codex.buildStartCommand(baseOpts);
     assert.ok(cmd.includes("codex"));
     assert.ok(cmd.includes("--full-auto"));
+    assert.ok(cmd.includes("-a never"));
+    assert.ok(cmd.includes("-s danger-full-access"));
     // Interactive mode: no exec subcommand, no cat pipe
     assert.ok(!cmd.includes("exec"));
   });

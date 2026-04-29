@@ -293,6 +293,7 @@ export const DEFAULT_AGENTS: AgentsMap = {
   },
   codex: {
     command: "codex",
+    args: ["-a", "never", "-s", "danger-full-access"],
     protocol: "post-create-send",
     interrupt: "ctrlc",
     language: "en",

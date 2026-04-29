@@ -24,7 +24,7 @@ Apex Manager 是一个 CLI 工具，基于三层架构：
 - **Daemon**（后台 Node.js 进程）—— 监控 Worker、跑测试、合并通过的分支、启动下游任务
 - **Worker**（独立终端）—— 每个 Agent 在自己的 git worktree 和终端窗口中执行任务
 
-零运行时依赖。纯 TypeScript。开箱支持 Claude、ft-claude、Codex、Gemini、OpenCode —— 可扩展到任何命令行 Agent。Git 仓库自动使用 worktree 隔离；非 Git 项目也能用（Worker 共享项目根目录）。
+零运行时依赖。纯 TypeScript。开箱支持 Claude、ft-claude、Codex、Gemini、OpenCode —— 可扩展到任何命令行 Agent。Git 仓库自动使用 worktree 隔离；非 Git 项目会明确退化到 shared project-root 模式（Worker 共享同一目录，并行修改可能互相冲突）。
 
 ## 核心特性
 
@@ -35,6 +35,8 @@ Apex Manager 是一个 CLI 工具，基于三层架构：
 - **多 Agent 异构。** Claude 做架构、Codex 做实现、Gemini 做安全审查 —— 在同一个工作流里。Agent 适配器处理差异：二进制路径、中断键、协议注入方式、能力画像。
 
 - **Skill/协议注入。** Worker 启动前，Apex Manager 从 Agent 的 skill 目录发现相关技能并注入为工作指令。Worker 拿到的不只是任务描述 —— 而是一套方法论。
+
+- **按 Worker 隔离的协议文件和启动验收。** 每个 Worker 都有自己的 `.apex-manager/workers/<task-id>/worker-protocol.md`，同时在自己的 worktree 里保留运行时副本。`spawn` 只有在验证窗口内出现真实动作时才算成功，不会再因为“只看到了 prompt”就误判启动完成。
 
 - **跨模型共识。** `--cross-model` 让同一个任务跑多个 Agent，结果自动综合去重。安全审查、架构评审 —— 多一个视角的成本远低于漏掉一个 bug。
 
@@ -91,6 +93,8 @@ Apex Manager 是一个 CLI 工具，基于三层架构：
 apex-manager init
 apex-manager worker spawn T1 --agent claude --protocol apex-forge
 apex-manager worker spawn T2 --agent codex
+apex-manager worker status T1
+apex-manager worker status T2
 apex-manager orch start
 ```
 
@@ -140,6 +144,7 @@ apex-manager orch stop
 ├── workers/
 │   └── T1/
 │       ├── meta.json        # worktree 路径、分支、Agent 类型
+│       ├── worker-protocol.md # 该 Worker 的控制面协议副本
 │       ├── status.json      # Worker 的进度更新
 │       ├── result.json      # 最终结论：pass / fail / blocked
 │       ├── escalation.json  # Worker → Plan Agent 的提问

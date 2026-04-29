@@ -193,6 +193,7 @@ describe("agentStartCommand", () => {
     const cmd = await agentStartCommand("claude", worktree);
     assert.ok(cmd.includes("claude"));
     assert.ok(cmd.includes("--append-system-prompt-file"));
+    assert.ok(cmd.includes(".apex-manager/workers/T3/worker-protocol.md"));
     assert.ok(cmd.includes(worktree));
   });
 
@@ -200,6 +201,8 @@ describe("agentStartCommand", () => {
     const cmd = await agentStartCommand("codex", worktree);
     assert.ok(cmd.includes("codex"));
     assert.ok(cmd.includes("--full-auto"));
+    assert.ok(cmd.includes("-a never"));
+    assert.ok(cmd.includes("-s danger-full-access"));
     assert.ok(!cmd.includes("exec"), "should not use one-shot exec mode");
     assert.ok(cmd.includes(worktree));
   });

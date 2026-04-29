@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "fs";
-import { readJSON, writeJSON } from "../utils/json.js";
+import { readJSON, updateJSON } from "../utils/json.js";
 import { apexPath, DEFAULT_MESSAGE_STORE, ensureProjectLayout } from "../utils/project-state.js";
 import { recordKernelEvent } from "../utils/events.js";
 import type { MessageRecord, MessageStore } from "../types/message.js";
@@ -50,8 +50,18 @@ async function loadMessageStore(): Promise<MessageStore> {
   return readJSON<MessageStore>(messageStorePath(), DEFAULT_MESSAGE_STORE);
 }
 
-async function saveMessageStore(store: MessageStore): Promise<void> {
-  await writeJSON(messageStorePath(), store);
+async function updateMessageStore<R>(
+  updater: (store: MessageStore) => Promise<R> | R,
+): Promise<R> {
+  ensureProjectLayout();
+  return updateJSON<MessageStore, R>(
+    messageStorePath(),
+    DEFAULT_MESSAGE_STORE,
+    async (store) => {
+      const result = await updater(store);
+      return { data: store, result };
+    },
+  );
 }
 
 function loadWorkerMeta(taskId: string): WorkerMeta | null {
@@ -83,6 +93,17 @@ function writeDirective(
 
 function cloneMessage(message: MessageRecord): MessageRecord {
   return JSON.parse(JSON.stringify(message)) as MessageRecord;
+}
+
+async function updateStoredMessage(
+  messageId: string,
+  updater: (message: MessageRecord) => Promise<void> | void,
+): Promise<MessageRecord> {
+  return updateMessageStore(async (store) => {
+    const message = requireMessage(store, messageId);
+    await updater(message);
+    return cloneMessage(message);
+  });
 }
 
 async function recordMessageEvent(
@@ -145,49 +166,57 @@ async function waitForAck(
   return false;
 }
 
-async function markDelivered(store: MessageStore, message: MessageRecord): Promise<void> {
-  const now = new Date().toISOString();
-  message.delivery_status = "delivered";
-  message.delivered_at = now;
-  message.last_delivery_attempt_at = now;
-  message.delivery_attempts = (message.delivery_attempts ?? 0) + 1;
-  message.last_error = undefined;
-  await saveMessageStore(store);
-  await recordMessageEvent("message.delivered", message, {
-    to: message.to,
+async function markDelivered(messageId: string): Promise<MessageRecord> {
+  const delivered = await updateStoredMessage(messageId, (message) => {
+    const now = new Date().toISOString();
+    message.delivery_status = "delivered";
+    message.delivered_at = now;
+    message.last_delivery_attempt_at = now;
+    message.delivery_attempts = (message.delivery_attempts ?? 0) + 1;
+    message.last_error = undefined;
+  });
+  await recordMessageEvent("message.delivered", delivered, {
+    to: delivered.to,
     transport: "terminal",
   });
+  return delivered;
 }
 
-async function markAcked(store: MessageStore, message: MessageRecord, by: string): Promise<void> {
-  message.delivery_status = "acked";
-  message.acknowledged_at = new Date().toISOString();
-  message.acknowledged_by = by;
-  await saveMessageStore(store);
-  await recordMessageEvent("message.acknowledged", message, {
+async function markAcked(messageId: string, by: string): Promise<MessageRecord> {
+  const acked = await updateStoredMessage(messageId, (message) => {
+    message.delivery_status = "acked";
+    message.acknowledged_at = new Date().toISOString();
+    message.acknowledged_by = by;
+  });
+  await recordMessageEvent("message.acknowledged", acked, {
     by,
   });
+  return acked;
 }
 
-async function markAckTimeout(store: MessageStore, message: MessageRecord): Promise<void> {
-  message.delivery_status = "ack_timeout";
-  await saveMessageStore(store);
-  await recordMessageEvent("message.ack_timeout", message, {
-    by: message.to,
+async function markAckTimeout(messageId: string): Promise<MessageRecord> {
+  const timedOut = await updateStoredMessage(messageId, (message) => {
+    message.delivery_status = "ack_timeout";
   });
+  await recordMessageEvent("message.ack_timeout", timedOut, {
+    by: timedOut.to,
+  });
+  return timedOut;
 }
 
-async function markFailed(store: MessageStore, message: MessageRecord, error: unknown): Promise<void> {
-  message.delivery_status = "failed";
-  message.last_error = String(error);
-  message.last_delivery_attempt_at = new Date().toISOString();
-  message.delivery_attempts = (message.delivery_attempts ?? 0) + 1;
-  await saveMessageStore(store);
-  await recordMessageEvent("message.failed", message, {
-    to: message.to,
+async function markFailed(messageId: string, error: unknown): Promise<MessageRecord> {
+  const failed = await updateStoredMessage(messageId, (message) => {
+    message.delivery_status = "failed";
+    message.last_error = String(error);
+    message.last_delivery_attempt_at = new Date().toISOString();
+    message.delivery_attempts = (message.delivery_attempts ?? 0) + 1;
+  });
+  await recordMessageEvent("message.failed", failed, {
+    to: failed.to,
     transport: "terminal",
     error: String(error),
   });
+  return failed;
 }
 
 async function maybeInterruptWorker(
@@ -210,7 +239,6 @@ async function maybeInterruptWorker(
 }
 
 async function attemptDelivery(
-  store: MessageStore,
   message: MessageRecord,
   meta: WorkerMeta,
   adapter: TerminalAdapter,
@@ -240,21 +268,22 @@ async function attemptDelivery(
 
   if (!idle) {
     if (message.priority === "urgent") {
-      message.last_error = "worker remained busy after interrupt";
-      await saveMessageStore(store);
+      message = await updateStoredMessage(message.id, (storedMessage) => {
+        storedMessage.last_error = "worker remained busy after interrupt";
+      });
     }
     return message;
   }
 
   await adapter.send(handle, renderMessageEnvelope(message));
-  await markDelivered(store, message);
+  message = await markDelivered(message.id);
 
   if (options.waitForAck && message.ack_required) {
     const acked = await waitForAck(adapter, handle, message.id, message.ack_timeout_ms ?? 30_000);
     if (acked) {
-      await markAcked(store, message, message.to);
+      message = await markAcked(message.id, message.to);
     } else {
-      await markAckTimeout(store, message);
+      message = await markAckTimeout(message.id);
     }
   }
 
@@ -262,7 +291,6 @@ async function attemptDelivery(
 }
 
 async function reconcileDeliveredMessageAck(
-  store: MessageStore,
   message: MessageRecord,
   adapter: TerminalAdapter,
   now = new Date(),
@@ -274,14 +302,13 @@ async function reconcileDeliveredMessageAck(
 
   const screen = await adapter.readScreen(meta.window_handle as WindowHandle, 20);
   if (messageAckSeen(screen, message.id)) {
-    await markAcked(store, message, message.to);
-    return message;
+    return markAcked(message.id, message.to);
   }
 
   const ackTimeoutMs = message.ack_timeout_ms ?? 30_000;
   const deliveredAt = new Date(message.delivered_at ?? message.created_at).getTime();
   if (now.getTime() - deliveredAt >= ackTimeoutMs) {
-    await markAckTimeout(store, message);
+    return markAckTimeout(message.id);
   }
 
   return message;
@@ -305,10 +332,7 @@ export async function getMessage(messageId: string): Promise<MessageRecord> {
 }
 
 export async function ackMessage(messageId: string, by: string): Promise<MessageRecord> {
-  const store = await loadMessageStore();
-  const message = requireMessage(store, messageId);
-  await markAcked(store, message, by);
-  return message;
+  return markAcked(messageId, by);
 }
 
 export async function processMessageQueueOnce(
@@ -334,12 +358,12 @@ export async function processMessageQueueOnce(
           ?? (meta.window_handle
             ? adapterForHandle(meta.window_handle as WindowHandle)
             : detectAdapter());
-        await attemptDelivery(store, message, meta, adapter, {
+        await attemptDelivery(message, meta, adapter, {
           idleWaitTimeoutMs: options.idleWaitTimeoutMs,
           idlePollIntervalMs: options.idlePollIntervalMs,
         });
       } catch (error) {
-        await markFailed(store, message, error);
+        await markFailed(message.id, error);
       }
     } else if (message.delivery_status === "delivered" && message.ack_required) {
       try {
@@ -348,14 +372,15 @@ export async function processMessageQueueOnce(
           continue;
         }
         const adapter = fallbackAdapter ?? adapterForHandle(meta.window_handle as WindowHandle);
-        await reconcileDeliveredMessageAck(store, message, adapter, options.now ?? new Date());
+        await reconcileDeliveredMessageAck(message, adapter, options.now ?? new Date());
       } catch {
         // Ignore read failures; daemon will retry on the next tick.
       }
     }
   }
 
-  const after = new Map(store.messages.map((message) => [message.id, message.delivery_status]));
+  const afterStore = await loadMessageStore();
+  const after = new Map(afterStore.messages.map((message) => [message.id, message.delivery_status]));
   let delivered = 0;
   let acked = 0;
   let timedOut = 0;
@@ -386,26 +411,28 @@ export async function sendStructuredMessage(
     throw new Error(`Worker ${options.to} has no terminal handle`);
   }
 
-  const store = await loadMessageStore();
-  const message: MessageRecord = {
-    id: `MSG-${store.next_id}`,
-    from: options.from,
-    to: options.to,
-    task_id: options.taskId,
-    kind: options.kind,
-    priority: options.priority ?? "normal",
-    ack_required: options.ackRequired ?? true,
-    ack_timeout_ms: options.ackRequired === false ? undefined : (options.ackTimeoutMs ?? 30_000),
-    body: options.body,
-    directive_action: options.directiveAction,
-    delivery_status: "pending",
-    delivery_attempts: 0,
-    created_at: new Date().toISOString(),
-  };
+  const message = await updateMessageStore((store) => {
+    const created: MessageRecord = {
+      id: `MSG-${store.next_id}`,
+      from: options.from,
+      to: options.to,
+      task_id: options.taskId,
+      kind: options.kind,
+      priority: options.priority ?? "normal",
+      ack_required: options.ackRequired ?? true,
+      ack_timeout_ms: options.ackRequired === false ? undefined : (options.ackTimeoutMs ?? 30_000),
+      body: options.body,
+      directive_action: options.directiveAction,
+      delivery_status: "pending",
+      delivery_attempts: 0,
+      created_at: new Date().toISOString(),
+    };
 
-  store.messages.push(message);
-  store.next_id += 1;
-  await saveMessageStore(store);
+    store.messages.push(created);
+    store.next_id += 1;
+    return cloneMessage(created);
+  });
+
   await recordMessageEvent("message.created", message, {
     from: message.from,
     to: message.to,
@@ -420,15 +447,13 @@ export async function sendStructuredMessage(
   const adapter = options.adapter ?? adapterForHandle(meta.window_handle as WindowHandle);
 
   try {
-    await attemptDelivery(store, message, meta, adapter, {
+    return await attemptDelivery(message, meta, adapter, {
       waitForAck: options.waitForAck,
       idleWaitTimeoutMs: options.idleWaitTimeoutMs,
       idlePollIntervalMs: options.idlePollIntervalMs,
     });
   } catch (error) {
-    await markFailed(store, message, error);
+    await markFailed(message.id, error);
     throw error;
   }
-
-  return cloneMessage(message);
 }

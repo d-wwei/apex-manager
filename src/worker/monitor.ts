@@ -32,13 +32,22 @@ export interface WorkerResult {
 export interface WorkerMeta {
   task_id: string;
   pid?: number;
-  window_handle: { id: string; name: string; adapter: string } | null;
+  window_handle: { id: string; name: string; adapter: string; session?: string } | null;
   worktree_path: string;
   branch: string;
   started_at: string;
   agent: string;
   /** "persistent" agents stay alive; "one-shot" agents exit after execution. */
   execution_mode?: "persistent" | "one-shot";
+  isolation_mode?: "git-worktree" | "project-root";
+  launch_verification?: {
+    state: "pending" | "verified" | "failed";
+    checked_at?: string;
+    action_signal?: "task_claimed" | "status_updated" | "result_written";
+    screen_summary?: string;
+    client_mapped?: boolean | null;
+    note?: string;
+  };
 }
 
 export interface WorkerHealth {

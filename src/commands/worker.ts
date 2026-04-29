@@ -2,7 +2,7 @@ import { spawnSync } from "child_process";
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync } from "fs";
 import { join, resolve } from "path";
 import { readJSON, writeJSON } from "../utils/json.js";
-import { buildWorkerProtocol, agentStartCommand } from "../worker/protocol-builder.js";
+import { buildWorkerProtocol, agentStartCommand, workerProtocolRelativePath } from "../worker/protocol-builder.js";
 import { adapterForHandle, detectAdapter } from "../worker/terminal.js";
 import type { Task, TaskStore } from "../types/task.js";
 import type { ProtocolBuildOptions } from "../worker/protocol-builder.js";
@@ -20,6 +20,9 @@ import { loadAgentsConfig, resolveAdapterWithConfig } from "../worker/agent-adap
 import { interruptKeys } from "../worker/interrupt.js";
 import { sendStructuredMessage } from "../worker/messages.js";
 import { isWorkerIdleScreen, waitForWorkerIdle } from "../worker/idle.js";
+import { buildWorkerKickoffMessage, verifyWorkerLaunch, waitForKickoffReady } from "../worker/launch.js";
+
+export { buildWorkerKickoffMessage } from "../worker/launch.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -73,52 +76,12 @@ function findTask(tasks: Task[], taskId: string): Task | undefined {
   return tasks.find((t) => t.id === taskId);
 }
 
-export function buildWorkerKickoffMessage(agentAdapter: AgentAdapter, relProtocolPath: string): string | null {
-  if (agentAdapter.needsPostCreateSend) {
-    return `Read the file ${relProtocolPath} and execute all tasks described in it. This is your complete work instruction.`;
-  }
-
-  if (agentAdapter.protocolInjection.type === "system-prompt-file") {
-    return `Start now. Your worker protocol from ${relProtocolPath} is already loaded in system context. Execute it immediately and continue autonomously until done or blocked.`;
-  }
-
-  return null;
+function workerRuntimeDir(worktreePath: string, taskId: string): string {
+  return join(worktreePath, ".apex-manager", "workers", taskId);
 }
 
-function summarizeSmokeScreen(screen: string): string {
-  const line = screen
-    .split("\n")
-    .map((entry) => entry.trim())
-    .reverse()
-    .find((entry) => entry.length > 0);
-  return line ?? "(screen empty)";
-}
-
-async function runStartupSmokeTest(taskId: string, terminal: TerminalAdapter, handle: WindowHandle): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, 1_500));
-
-  try {
-    const screen = await terminal.readScreen(handle, 8);
-    console.log(`[smoke] ${taskId}: ${summarizeSmokeScreen(screen).slice(0, 140)}`);
-  } catch (error) {
-    console.warn(`[smoke] ${taskId}: unable to read terminal yet (${String(error)})`);
-  }
-}
-
-async function waitForKickoffReady(
-  taskId: string,
-  agent: string,
-  terminal: TerminalAdapter,
-  handle: WindowHandle,
-): Promise<void> {
-  try {
-    const ready = await waitForWorkerIdle(terminal, handle, agent, 30_000, 500);
-    if (!ready) {
-      console.warn(`[warn] ${taskId}: worker did not show an idle prompt within 30s; sending kickoff anyway`);
-    }
-  } catch (error) {
-    console.warn(`[warn] ${taskId}: unable to confirm worker readiness (${String(error)}); sending kickoff anyway`);
-  }
+function workerControlDir(projectRoot: string, taskId: string): string {
+  return join(projectRoot, ".apex-manager", "workers", taskId);
 }
 
 // WorkerMeta imported from ../worker/monitor.js
@@ -200,8 +163,8 @@ async function cmdSpawn(args: string[]): Promise<void> {
       }
     }
   } else {
-    // Non-git repo: no worktree isolation, work directly in project root
-    console.warn(`[warn] Not a git repository — worker will run in project root (no isolation)`);
+    // Non-git repo: no worktree isolation, work directly in project root.
+    console.warn(`[warn] ${taskId}: current directory is not a git repository. Falling back to shared project-root execution without worktree isolation. Parallel edits may conflict; prefer running apex-manager from a real repo root.`);
     worktreeRel = ".";
     worktreePath = projectRoot;
     branch = "";
@@ -232,13 +195,20 @@ async function cmdSpawn(args: string[]): Promise<void> {
     isolated,
   };
 
-  const protocol = buildWorkerProtocol(opts);
-  const protocolPath = join(worktreeApex, "worker-protocol.md");
-  writeFileSync(protocolPath, protocol);
-
   // 6. Write worker registration
-  const workersDir = join(projectRoot, ".apex-manager", "workers", taskId);
+  const workersDir = workerControlDir(projectRoot, taskId);
   mkdirSync(workersDir, { recursive: true });
+  const runtimeWorkerDir = workerRuntimeDir(worktreePath, taskId);
+  mkdirSync(runtimeWorkerDir, { recursive: true });
+
+  const protocol = buildWorkerProtocol(opts);
+  const protocolRelPath = workerProtocolRelativePath(taskId);
+  const runtimeProtocolPath = join(runtimeWorkerDir, "worker-protocol.md");
+  const controlProtocolPath = join(workersDir, "worker-protocol.md");
+  writeFileSync(runtimeProtocolPath, protocol);
+  if (resolve(runtimeProtocolPath) !== resolve(controlProtocolPath)) {
+    writeFileSync(controlProtocolPath, protocol);
+  }
 
   const meta: WorkerMeta = {
     task_id: taskId,
@@ -248,14 +218,21 @@ async function cmdSpawn(args: string[]): Promise<void> {
     started_at: new Date().toISOString(),
     agent,
     execution_mode: agentAdapter.executionMode,
+    isolation_mode: isolated ? "git-worktree" : "project-root",
+    launch_verification: {
+      state: "pending",
+    },
   };
 
   await writeJSON(join(workersDir, "meta.json"), meta);
 
   // 7. Dry-run: print protocol and exit
   if (isDryRun) {
-    console.log(`[dry-run] Protocol generated at ${protocolPath}`);
-    console.log(`[dry-run] Agent: ${agent}, Worktree: ${worktreeRel}`);
+    console.log(`[dry-run] Protocol generated at ${runtimeProtocolPath}`);
+    if (resolve(runtimeProtocolPath) !== resolve(controlProtocolPath)) {
+      console.log(`[dry-run] Control-plane copy at ${controlProtocolPath}`);
+    }
+    console.log(`[dry-run] Agent: ${agent}, Worktree: ${worktreeRel}, Isolation: ${meta.isolation_mode}`);
     console.log(protocol);
     return;
   }
@@ -263,7 +240,7 @@ async function cmdSpawn(args: string[]): Promise<void> {
   // 8. Create terminal window
   const slug = toSlug(task.title);
   const windowName = `${taskId}-${slug}`;
-  const command = await agentStartCommand(agent, worktreePath);
+  const command = await agentStartCommand(agent, worktreePath, protocolRelPath);
 
   const terminal = detectAdapter();
   const handle = await terminal.createWindow(windowName, command);
@@ -278,15 +255,29 @@ async function cmdSpawn(args: string[]): Promise<void> {
   });
 
   // 10. Kick off the worker once the interactive CLI is ready.
-  const relProtocol = ".apex-manager/worker-protocol.md";
-  const kickoffMessage = buildWorkerKickoffMessage(agentAdapter, relProtocol);
+  const kickoffMessage = buildWorkerKickoffMessage(agentAdapter, protocolRelPath);
   if (kickoffMessage) {
     await waitForKickoffReady(taskId, agent, terminal, handle);
     await terminal.send(handle, kickoffMessage);
   }
 
-  // 11. Smoke test the terminal shortly after spawn so false-positive launches are obvious.
-  await runStartupSmokeTest(taskId, terminal, handle);
+  // 11. Verify actual launch activity, not just a visible prompt.
+  const verification = await verifyWorkerLaunch(projectRoot, taskId, taskId, terminal, handle);
+  meta.launch_verification = verification;
+  await writeJSON(join(workersDir, "meta.json"), meta);
+  await recordKernelEvent({
+    type: verification.state === "verified" ? "worker.launch_verified" : "worker.launch_failed",
+    timestamp: verification.checked_at ?? new Date().toISOString(),
+    worker_id: taskId,
+    verification,
+  });
+
+  if (verification.state === "verified") {
+    console.log(`[smoke] ${taskId}: ${verification.action_signal}${verification.note ? `; ${verification.note}` : ""}${verification.screen_summary ? `; screen=${verification.screen_summary}` : ""}`);
+  } else {
+    console.error(`[smoke] ${taskId}: launch verification failed. ${verification.note ?? "No activity detected."}${verification.screen_summary ? ` screen=${verification.screen_summary}` : ""}`);
+    process.exit(1);
+  }
 
   // 12. Print confirmation
   console.log(`Worker ${taskId} spawned in window ${windowName} (agent: ${agent}, worktree: ${worktreeRel})`);
@@ -797,8 +788,9 @@ export async function cmdWorker(args: string[]): Promise<void> {
         else status = "unknown";
         const stage = w.status?.stage ?? "\u2014";
         const started = timeAgo(w.meta.started_at);
+        const launchPrefix = w.meta.launch_verification?.state === "failed" ? "!" : " ";
         console.log(
-          `  ${w.meta.task_id.padEnd(9)}${w.meta.agent.padEnd(11)}${stage.padEnd(13)}${status.padEnd(13)}${started}`,
+          `${launchPrefix} ${w.meta.task_id.padEnd(8)}${w.meta.agent.padEnd(11)}${stage.padEnd(13)}${status.padEnd(13)}${started}`,
         );
       }
       break;
@@ -837,8 +829,18 @@ export async function cmdWorker(args: string[]): Promise<void> {
         `  Stage: ${info.status?.stage ?? "\u2014"}`,
         `  Progress: ${info.status?.progress ?? "\u2014"}`,
         `  Health: ${statusLabel}`,
+        `  Isolation: ${info.meta.isolation_mode ?? "git-worktree"}`,
         `  Started: ${timeAgo(info.meta.started_at)}`,
       ];
+      if (info.meta.launch_verification) {
+        lines.push(`  Launch verification: ${info.meta.launch_verification.state}`);
+        if (info.meta.launch_verification.action_signal) {
+          lines.push(`  Launch signal: ${info.meta.launch_verification.action_signal}`);
+        }
+        if (info.meta.launch_verification.note) {
+          lines.push(`  Launch note: ${info.meta.launch_verification.note}`);
+        }
+      }
       if (info.status?.last_activity) {
         lines.push(`  Last activity: ${timeAgo(info.status.last_activity)}`);
       }
