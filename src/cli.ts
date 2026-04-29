@@ -10,9 +10,12 @@ Usage:
   apex-manager <command> [options]
 
 Commands:
+  init     Initialize local .apex-manager state
   worker   Manage parallel worker agents (spawn, kill, list, status, merge, ...)
   orch     Orchestration daemon (start, stop, status)
-  task     Task management (coming soon)
+  task     Task management
+  artifact Generic artifact management
+  msg      Generic team messaging
 
 Options:
   --help   Show this help message
@@ -44,6 +47,11 @@ async function main(): Promise<void> {
       await cmdWorker(subArgs);
       break;
     }
+    case "init": {
+      const { cmdInit } = await import("./commands/init.js");
+      await cmdInit(subArgs);
+      break;
+    }
     case "orch": {
       const { cmdOrch } = await import("./commands/orch.js");
       await cmdOrch(subArgs);
@@ -52,6 +60,16 @@ async function main(): Promise<void> {
     case "task": {
       const { cmdTask } = await import("./commands/task.js");
       await cmdTask(subArgs);
+      break;
+    }
+    case "artifact": {
+      const { cmdArtifact } = await import("./commands/artifact.js");
+      await cmdArtifact(subArgs);
+      break;
+    }
+    case "msg": {
+      const { cmdMsg } = await import("./commands/msg.js");
+      await cmdMsg(subArgs);
       break;
     }
     default: {

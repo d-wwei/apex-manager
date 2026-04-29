@@ -7,7 +7,7 @@ SKILL_NAME="apex-manager"
 echo "Installing $SKILL_NAME..."
 
 # Install to skill directories
-for base in ~/.claude/skills ~/.codex/skills ~/.gemini/skills; do
+for base in ~/.agents/skills ~/.claude/skills ~/.codex/skills ~/.gemini/skills; do
   mkdir -p "$base"
   target="$base/$SKILL_NAME"
   if [ -L "$target" ] || [ -d "$target" ]; then

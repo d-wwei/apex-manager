@@ -11,6 +11,7 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { createDaemonState, runDaemon } from "../daemon/daemon.js";
 import { readPendingNotifications } from "../daemon/notify.js";
+import { readKernelEvents, readProjectSnapshot, rebuildProjectSnapshotFromEvents } from "../utils/events.js";
 import type { WindowHandle } from "../worker/terminal.js";
 
 const LOCK_PATH = ".apex-manager/orch.lock";
@@ -220,6 +221,40 @@ async function cmdStatus(): Promise<void> {
   }
 }
 
+function flagValue(args: string[], flag: string): string | undefined {
+  const idx = args.indexOf(flag);
+  return idx >= 0 && args[idx + 1] ? args[idx + 1] : undefined;
+}
+
+async function cmdEvents(args: string[]): Promise<void> {
+  const tail = Number(flagValue(args, "--tail") ?? "20");
+  const typeFilter = flagValue(args, "--type");
+  const events = await readKernelEvents();
+  const filtered = typeFilter
+    ? events.filter((event) => event.type === typeFilter)
+    : events;
+
+  const slice = filtered.slice(Math.max(0, filtered.length - tail));
+  if (slice.length === 0) {
+    console.log("No events.");
+    return;
+  }
+
+  for (const event of slice) {
+    console.log(`${event.timestamp}  ${event.type}`);
+  }
+}
+
+async function cmdSnapshot(args: string[]): Promise<void> {
+  const snapshot = args.includes("--rebuild")
+    ? await rebuildProjectSnapshotFromEvents()
+    : await readProjectSnapshot();
+
+  console.log(`Snapshot generated_at=${snapshot.generated_at}`);
+  console.log(`  tasks=${snapshot.tasks.length} artifacts=${snapshot.artifacts.length} messages=${snapshot.messages.length} workers=${snapshot.workers.length}`);
+  console.log(`  open_tasks=${snapshot.stats.open_tasks} blocked_tasks=${snapshot.stats.blocked_tasks} pending_messages=${snapshot.stats.pending_messages}`);
+}
+
 // ── Main dispatch ──────────────────────────────────────────────────────
 
 export async function cmdOrch(args: string[]): Promise<void> {
@@ -236,7 +271,13 @@ export async function cmdOrch(args: string[]): Promise<void> {
     case "status":
       await cmdStatus();
       break;
+    case "events":
+      await cmdEvents(rest);
+      break;
+    case "snapshot":
+      await cmdSnapshot(rest);
+      break;
     default:
-      console.log("Usage: apex-manager orch <start|stop|status> [--force]");
+      console.log("Usage: apex-manager orch <start|stop|status|events|snapshot> [--force]");
   }
 }

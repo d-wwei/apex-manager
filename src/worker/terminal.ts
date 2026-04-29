@@ -6,6 +6,7 @@ export interface WindowHandle {
   id: string;       // tmux target or cmux surface ID
   name: string;     // window title (e.g. "T1-auth-api")
   adapter: string;  // "cmux" | "tmux"
+  session?: string; // tmux session name when applicable
 }
 
 // --- TerminalAdapter ---
@@ -71,6 +72,13 @@ export class CmuxAdapter implements TerminalAdapter {
     return which("cmux") ? "cmux" : CMUX_BIN;
   }
 
+  private submit(surfaceId: string): void {
+    const result = run(this.bin(), ["send-key", surfaceId, "enter"]);
+    if (!result.ok) {
+      throw new Error(`cmux send-key failed: ${result.stderr}`);
+    }
+  }
+
   async createWindow(name: string, command: string): Promise<WindowHandle> {
     const bin = this.bin();
 
@@ -87,6 +95,7 @@ export class CmuxAdapter implements TerminalAdapter {
       if (!sendResult.ok) {
         throw new Error(`cmux send failed: ${sendResult.stderr}`);
       }
+      this.submit(surfaceId);
       run(bin, ["rename-tab", surfaceId, name]);
       return { id: surfaceId, name, adapter: "cmux" };
     }
@@ -98,6 +107,7 @@ export class CmuxAdapter implements TerminalAdapter {
     if (!sendResult.ok) {
       throw new Error(`cmux send failed: ${sendResult.stderr}`);
     }
+    this.submit(surfaceId);
 
     // Rename the tab for identification
     run(bin, ["rename-tab", surfaceId, name]);
@@ -110,6 +120,7 @@ export class CmuxAdapter implements TerminalAdapter {
     if (!result.ok) {
       throw new Error(`cmux send failed: ${result.stderr}`);
     }
+    this.submit(handle.id);
   }
 
   async readScreen(handle: WindowHandle, lines?: number): Promise<string> {
@@ -159,7 +170,22 @@ export class CmuxAdapter implements TerminalAdapter {
 
 // --- TmuxAdapter ---
 
-const TMUX_SESSION_NAME = "apex-workers";
+const TMUX_SESSION_PREFIX = "apex-worker";
+
+export interface TmuxClientInfo {
+  tty: string;
+  session: string;
+  windowId: string;
+  windowName: string;
+}
+
+export interface TmuxHandleInspection {
+  session: string;
+  windowId: string;
+  windowName: string;
+  clients: TmuxClientInfo[];
+  matchedClients: TmuxClientInfo[];
+}
 
 export class TmuxAdapter implements TerminalAdapter {
   name(): string {
@@ -174,37 +200,30 @@ export class TmuxAdapter implements TerminalAdapter {
     }
   }
 
-  /** Track whether we already opened the viewer window this process. */
-  private viewerOpened = false;
+  private sanitizeSessionFragment(name: string): string {
+    const normalized = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    return normalized || "worker";
+  }
 
-  /**
-   * Ensure the apex-workers tmux session exists.
-   * Called automatically when not inside a tmux session.
-   * On first call, also opens a visible Terminal.app window attached to the session.
-   */
-  private ensureSession(): void {
-    const check = run("tmux", ["has-session", "-t", TMUX_SESSION_NAME]);
-    if (!check.ok) {
-      const create = run("tmux", ["new-session", "-d", "-s", TMUX_SESSION_NAME]);
-      if (!create.ok) {
-        throw new Error(`Failed to create tmux session '${TMUX_SESSION_NAME}': ${create.stderr}`);
-      }
-    }
+  private makeDetachedSessionName(name: string): string {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    return `${TMUX_SESSION_PREFIX}-${this.sanitizeSessionFragment(name)}-${suffix}`;
+  }
 
-    // Auto-open a terminal window so workers are visible (once per process)
-    if (!this.viewerOpened) {
-      this.viewerOpened = true;
-      this.openViewer();
+  private submit(handle: WindowHandle): void {
+    const result = run("tmux", ["send-keys", "-t", handle.id, "Enter"]);
+    if (!result.ok) {
+      throw new Error(`tmux submit failed: ${result.stderr}`);
     }
   }
 
   /**
-   * Open a visible terminal window attached to the apex-workers session.
+   * Open a visible terminal window attached to a worker-dedicated tmux session.
    * Auto-detects the user's terminal emulator on macOS; skips silently on
    * unsupported platforms or unknown terminals.
    */
-  private openViewer(): void {
-    const attachCmd = `tmux attach -t ${TMUX_SESSION_NAME}`;
+  private openViewer(sessionName: string): void {
+    const attachCmd = `tmux attach -t ${sessionName}`;
 
     if (process.platform === "darwin") {
       const term = process.env.TERM_PROGRAM ?? "";
@@ -232,9 +251,9 @@ export class TmuxAdapter implements TerminalAdapter {
     // Windows (WSL): use Windows Terminal (wt.exe) if available
     if (process.platform === "linux" && process.env.WSL_DISTRO_NAME) {
       if (which("wt.exe")) {
-        run("wt.exe", ["new-tab", "wsl", "--", "tmux", "attach", "-t", TMUX_SESSION_NAME]);
+        run("wt.exe", ["new-tab", "wsl", "--", "tmux", "attach", "-t", sessionName]);
       }
-      // If no wt.exe, user can run `tmux attach -t apex-workers` manually
+      // If no wt.exe, user can run `tmux attach -t <session>` manually
     }
   }
 
@@ -255,23 +274,39 @@ export class TmuxAdapter implements TerminalAdapter {
         run("tmux", ["select-layout", "tiled"]);
       }
     } else {
-      // Outside tmux: ensure detached session exists, create window in it
-      this.ensureSession();
-      result = run("tmux", ["new-window", "-t", TMUX_SESSION_NAME, "-n", name, "-P", "-F", "#{window_id}", command]);
+      // Outside tmux: each worker gets its own detached session and viewer.
+      const sessionName = this.makeDetachedSessionName(name);
+      result = run("tmux", ["new-session", "-d", "-s", sessionName, "-n", name, "-P", "-F", "#{window_id}", command]);
+      if (result.ok) {
+        this.openViewer(sessionName);
+      }
+      if (!result.ok) {
+        throw new Error(`tmux create session failed: ${result.stderr}`);
+      }
+      const target = result.stdout;
+      return { id: target, name, adapter: "tmux", session: sessionName };
     }
 
     if (!result.ok) {
       throw new Error(`tmux create pane/window failed: ${result.stderr}`);
     }
     const target = result.stdout;
-    return { id: target, name, adapter: "tmux" };
+    const sessionResult = run("tmux", ["display-message", "-p", "-t", target, "#{session_name}"]);
+    return {
+      id: target,
+      name,
+      adapter: "tmux",
+      session: sessionResult.ok ? sessionResult.stdout : undefined,
+    };
   }
 
   async send(handle: WindowHandle, text: string): Promise<void> {
-    const result = run("tmux", ["send-keys", "-t", handle.id, text, "Enter"]);
+    const result = run("tmux", ["send-keys", "-t", handle.id, "-l", text]);
     if (!result.ok) {
       throw new Error(`tmux send-keys failed: ${result.stderr}`);
     }
+    await sleep(60);
+    this.submit(handle);
   }
 
   async readScreen(handle: WindowHandle, lines?: number): Promise<string> {
@@ -287,6 +322,10 @@ export class TmuxAdapter implements TerminalAdapter {
   }
 
   async close(handle: WindowHandle): Promise<void> {
+    if (handle.session?.startsWith(TMUX_SESSION_PREFIX)) {
+      run("tmux", ["kill-session", "-t", handle.session]);
+      return;
+    }
     // pane_id starts with %, window_id starts with @
     if (handle.id.startsWith("%")) {
       run("tmux", ["kill-pane", "-t", handle.id]);
@@ -325,6 +364,47 @@ export class TmuxAdapter implements TerminalAdapter {
 }
 
 // --- Auto-detection ---
+
+export function adapterForHandle(handle: WindowHandle | null | undefined): TerminalAdapter {
+  if (handle?.adapter === "cmux") {
+    return new CmuxAdapter();
+  }
+  if (handle?.adapter === "tmux") {
+    return new TmuxAdapter();
+  }
+  return detectAdapter();
+}
+
+export function inspectTmuxHandle(handle: WindowHandle): TmuxHandleInspection | null {
+  if (handle.adapter !== "tmux" || !which("tmux")) {
+    return null;
+  }
+
+  const target = run("tmux", ["display-message", "-p", "-t", handle.id, "#{session_name}\t#{window_id}\t#{window_name}"]);
+  if (!target.ok) {
+    return null;
+  }
+
+  const [session = "", windowId = "", windowName = ""] = target.stdout.split("\t");
+  const clientsResult = run("tmux", ["list-clients", "-F", "#{client_tty}\t#{session_name}\t#{window_id}\t#{window_name}"]);
+  const clients: TmuxClientInfo[] = clientsResult.ok
+    ? clientsResult.stdout
+        .split("\n")
+        .filter((line) => line.trim().length > 0)
+        .map((line) => {
+          const [tty = "", clientSession = "", clientWindowId = "", clientWindowName = ""] = line.split("\t");
+          return {
+            tty,
+            session: clientSession,
+            windowId: clientWindowId,
+            windowName: clientWindowName,
+          };
+        })
+    : [];
+
+  const matchedClients = clients.filter((client) => client.session === session && client.windowId === windowId);
+  return { session, windowId, windowName, clients, matchedClients };
+}
 
 export function detectAdapter(): TerminalAdapter {
   // Priority 1: cmux env vars — any of these means we're inside a cmux session.

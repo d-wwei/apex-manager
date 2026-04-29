@@ -140,6 +140,7 @@ describe("apex worker list", () => {
     writeWorkerFile(tmpDir, "T3", "meta.json", {
       ...makeMeta("T3", "gemini"),
       pid: 2147483647, // non-existent PID
+      started_at: new Date(Date.now() - 30_000).toISOString(),
     });
 
     const { cmdWorker } = await import("../../src/commands/worker.js");
@@ -148,6 +149,21 @@ describe("apex worker list", () => {
     const output = logOutput.join("\n");
     assert.ok(output.includes("T3"));
     assert.ok(output.includes("CRASHED"));
+  });
+
+  it("shows STARTING for a fresh worker before any heartbeat arrives", async () => {
+    writeWorkerFile(tmpDir, "T4", "meta.json", {
+      ...makeMeta("T4", "claude"),
+      pid: 2147483647,
+      started_at: new Date().toISOString(),
+    });
+
+    const { cmdWorker } = await import("../../src/commands/worker.js");
+    await cmdWorker(["list"]);
+
+    const output = logOutput.join("\n");
+    assert.ok(output.includes("T4"));
+    assert.ok(output.includes("STARTING"));
   });
 });
 
@@ -184,6 +200,21 @@ describe("apex worker status", () => {
     const output = logOutput.join("\n");
     assert.ok(output.includes("pass"));
     assert.ok(output.includes("All tests green"));
+  });
+
+  it("shows STARTING health for a fresh worker without heartbeat yet", async () => {
+    writeWorkerFile(tmpDir, "T2", "meta.json", {
+      ...makeMeta("T2", "claude"),
+      pid: 2147483647,
+      started_at: new Date().toISOString(),
+    });
+
+    const { cmdWorker } = await import("../../src/commands/worker.js");
+    await cmdWorker(["status", "T2"]);
+
+    const output = logOutput.join("\n");
+    assert.ok(output.includes("Worker T2"));
+    assert.ok(output.includes("Health: STARTING"));
   });
 
   it("exits with error for missing task-id argument", async () => {

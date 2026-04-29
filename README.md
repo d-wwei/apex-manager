@@ -2,212 +2,311 @@
 
 # Apex Manager
 
-**Run multiple AI coding agents on the same codebase in parallel — each isolated in its own git worktree, integrated by a deterministic daemon, supervised by you.**
+`apex-manager` is a local, terminal-first multi-agent orchestrator.
 
-## Why This?
+It helps one "plan agent" session coordinate multiple worker agent CLIs on the same project, with:
+- task creation and dependency tracking
+- per-worker terminal sessions
+- git worktree isolation when the project is a git repo
+- structured manager-to-worker messaging
+- daemon-based monitoring and recovery state
+- artifact capture and event journaling
 
-You're in a Claude Code session. You need a feature built, tests written, docs updated, and a security review done. Four tasks — should take 20 minutes with four agents instead of 2 hours with one.
+This README is intentionally grounded in the current codebase and CLI, not the roadmap.
 
-So you open four terminals. Create four branches. Start four agents. Twenty minutes later, you've spent fifteen of those switching between terminals, resolving a merge conflict because T2 started before T1's branch was ready, re-running T3 because it worked against stale code, and wondering whether T4 finished or crashed.
+## What It Does Today
 
-The problem isn't the agents. They can code. The problem is coordination — and it scales worse than the work itself. Most multi-agent setups treat agents as collaborators sharing one workspace. Wrong model. Parallel agents need isolation, like workers on different floors of a construction site: own tools, own materials, own section, one foreman.
+Apex Manager currently provides a working local control plane around `.apex-manager/`.
 
-Apex Manager gives each agent an isolated git worktree. A deterministic daemon monitors progress, runs tests, merges clean work. You stay in the decision loop — not the coordination loop.
+Core capabilities:
+- `init` creates the local state directory and default stores.
+- `task` manages task creation, dependencies, claiming, completion, blocking, and updates.
+- `worker spawn` creates a worker terminal, writes a per-worker protocol file, and verifies real launch activity before reporting success.
+- `worker tell/ask/inject` sends structured messages with pending/delivered/acked tracking.
+- `msg` exposes the underlying message store directly.
+- `artifact` stores generic task outputs with metadata.
+- `orch` runs the background daemon, shows status, prints recent events, and rebuilds snapshots.
+- `--cross-model` can spawn the same task across multiple agents and later synthesize results.
 
-## What It Is
+Built-in agent defaults currently include:
+- `claude`
+- `ft-claude`
+- `codex`
+- `gemini`
+- `opencode`
 
-Apex Manager is a CLI tool built on a three-layer architecture:
+Custom agents can be added through `.apex-manager/agents.json`.
 
-- **Plan Agent** (you, in your current AI session) — designs tasks, makes decisions, handles failures
-- **Daemon** (background Node.js process) — monitors workers, runs tests, merges passing branches, spawns dependent tasks
-- **Workers** (isolated terminals) — each agent runs in its own git worktree with its own terminal window
+## Mental Model
 
-Zero runtime dependencies. Pure TypeScript. Works with Claude, ft-claude, Codex, Gemini, and OpenCode out of the box — extensible to any CLI-based agent. Git repos get full worktree isolation; non-git projects work too (workers share the project root).
+There are three layers:
 
-## Key Features
+1. The plan agent
+This is your current AI session. It decides what tasks exist and when to intervene.
 
-- **Git worktree isolation.** Each worker gets a real, independent copy of the codebase. No file conflicts, no half-committed states. When a worker finishes, its branch gets tested in a temp worktree and merged — cleanly.
+2. The daemon
+This is a local Node.js background loop. It monitors worker state, processes pending messages, records events, and manages orchestration lifecycle.
 
-- **Deterministic daemon.** The automation layer has zero AI. A 10-second tick loop checks worker health, runs integration tests, fast-forward merges passing branches, spawns unblocked tasks. Predictable. Auditable. Won't hallucinate a merge.
+3. The workers
+These are separate CLI agent sessions running in `tmux` or `cmux`, usually one per task.
 
-- **Multi-agent heterogeneity.** Assign Claude to architecture, Codex to implementation, Gemini to security review — in the same workflow. Agent-specific adapters handle the differences: binary paths, interrupt keys, protocol injection methods, capability profiles.
+The system is local-first. There is no central server.
 
-- **Skill/protocol injection.** Before a worker starts, Apex Manager discovers relevant skills from your agent's skill directory and injects them as work instructions. A worker doesn't just get a task — it gets a methodology.
+## Requirements
 
-- **Cross-model consensus.** Run the same task through multiple agents with `--cross-model`. Results are synthesized and deduplicated. For security audits, architecture reviews, or anything where a second opinion costs less than a missed bug.
+- macOS or Linux
+- Node.js 18+
+- one terminal multiplexer available:
+  - `tmux`, or
+  - `cmux`
+- git if you want true worktree isolation
 
-- **Cost tracking at task granularity.** Per-worker token accounting with model-specific pricing (Opus, Sonnet, Haiku). Budget warnings and hard limits. Know exactly what each parallel workstream costs.
+Notes:
+- If the current directory is not a git repo, workers fall back to shared project-root mode. That works, but there is no filesystem isolation between workers.
+- On macOS, Apex Manager can operate through either `tmux` or `cmux`. In many real setups, `tmux` is the simpler baseline.
 
-## Before / After
+## Install
 
-| | Manual Multi-Agent | With Apex Manager |
-|---|---|---|
-| **Workspace** | Agents share one directory — file conflicts | Each agent gets an isolated git worktree |
-| **Coordination** | You juggle terminals and branches | Daemon auto-monitors, auto-tests, auto-merges |
-| **Integration** | Merge and pray tests pass | Tests run in temp worktree *before* merge to main |
-| **Failure** | You notice something broke... eventually | Daemon captures terminal state, notifies you immediately |
-| **Parallelism** | Theoretical — coordination overhead eats the gain | Real — agents are truly independent |
-| **Agent diversity** | One agent type, or manual switching | Claude + Codex + Gemini on different tasks, same workflow |
-
-## How It Works
-
-### Architecture
-
-```
-┌─────────────────────────────────────────────────┐
-│               Plan Agent (you)                   │
-│     Task design · Decisions · Failure triage     │
-└────────────────────┬────────────────────────────┘
-                     │ apex-manager CLI
-                     ▼
-┌─────────────────────────────────────────────────┐
-│              Daemon (background)                  │
-│  10s tick: monitor → test → merge → spawn → notify│
-└──┬──────────────┬──────────────┬────────────────┘
-   │              │              │
-   ▼              ▼              ▼
-┌────────┐   ┌────────┐   ┌────────┐
-│  T1    │   │  T2    │   │  T3    │
-│ Claude │   │ Codex  │   │ Gemini │
-│worktree│   │worktree│   │worktree│
-└────────┘   └────────┘   └────────┘
-```
-
-**The Plan Agent** (your current AI session) handles judgment: what to build, how to respond to failures, when to change course. **The Daemon** handles automation: pure code, no AI, deterministic and auditable. **Workers** handle execution: each in an isolated terminal with its own git worktree.
-
-No layer does another layer's job. Workers can't orchestrate. The daemon can't make judgment calls. You don't manually merge branches.
-
-### Workflow
-
-**Phase 1 — Kick off workers and daemon:**
+If you just want to run the CLI in this repo:
 
 ```bash
-apex-manager worker spawn T1 --agent claude --protocol apex-forge
-apex-manager worker spawn T2 --agent codex
-apex-manager orch start
+npm install
+npx tsx src/cli.ts --help
 ```
 
-**Phase 2 — Monitor, adjust, intervene when needed:**
+If you want the shell command:
 
 ```bash
-apex-manager orch status
-apex-manager worker directive T1 amend "Also handle edge case X" --urgent
-apex-manager worker status T1      # read terminal output
-apex-manager worker interrupt T1   # stop the agent
+npm install
+npm link
+apex-manager --help
 ```
 
-**Phase 3 — Daemon auto-merges passing work. Wrap up:**
+If you also want the local skill entry installed into agent runtimes:
 
 ```bash
-apex-manager worker merge-all --strategy local
-apex-manager orch stop
+./install.sh
 ```
 
-### Design Decisions
-
-| Choice | Why |
-|--------|-----|
-| Git worktrees over branches | Real filesystem isolation — agents can't interfere with each other's uncommitted work |
-| Deterministic daemon (no AI) | Merge decisions should come from test results, not LLM judgment |
-| File-based IPC over network | Observable (read JSON to debug), fault-tolerant, no server to crash |
-| Terminal multiplexer (tmux/cmux) | Direct screen reading for diagnostics, sendKey for interrupts — real control |
-| Zero runtime dependencies | One `tsx` call and it runs. Nothing to install, nothing to break |
-
-### File-Based IPC
-
-All state flows through `.apex-manager/`:
-
-```
-.apex-manager/
-├── config.yaml              # Settings
-├── tasks.json               # Task DAG
-├── workers/
-│   └── T1/
-│       ├── meta.json        # Worktree path, branch, agent type
-│       ├── status.json      # Worker's progress updates
-│       ├── result.json      # Final verdict: pass / fail / blocked
-│       ├── escalation.json  # Worker → Plan Agent questions
-│       └── directive.json   # Plan Agent → Worker instructions
-├── notifications/           # Daemon → Plan Agent queue
-├── orch.lock                # Single-daemon guarantee
-└── event-log.jsonl          # Audit trail
-```
+That installer symlinks this repo into:
+- `~/.agents/skills/apex-manager`
+- `~/.claude/skills/apex-manager`
+- `~/.codex/skills/apex-manager`
+- `~/.gemini/skills/apex-manager`
 
 ## Quick Start
 
-**Prerequisites:** Node.js >= 18, git, tmux (Linux) or cmux (macOS)
+Initialize local state:
 
 ```bash
-# 1. Clone
-git clone <repo-url>
-cd apex-manager && npm install
-
-# 2. Spawn a worker
-npx tsx src/cli.ts worker spawn T1 --agent claude
-
-# 3. Start the daemon
-npx tsx src/cli.ts orch start
-
-# 4. Check status
-npx tsx src/cli.ts orch status
+apex-manager init
 ```
 
-### CLI Reference
+Check which agent CLIs are available:
 
 ```bash
-# Worker commands
-apex-manager worker spawn <id> [--agent claude|codex|gemini|opencode] [--protocol <skill>] [--cross-model]
-apex-manager worker kill <id>
-apex-manager worker list
-apex-manager worker status <id>
-apex-manager worker interrupt <id>
-apex-manager worker directive <id> <amend|pause|abort|info> <content> [--urgent]
-apex-manager worker merge <id> [--strategy local|pr|squash]
-apex-manager worker merge-all
-apex-manager worker check           # available agents
-apex-manager worker report          # cost report
+apex-manager worker check
+```
 
-# Daemon commands
+Create a few tasks:
+
+```bash
+apex-manager task create "Build API" "Implement the endpoint and tests"
+apex-manager task create "Review API" "Review the implementation" --depends T1 --agent codex
+apex-manager task list
+```
+
+Spawn a worker:
+
+```bash
+apex-manager worker spawn T1 --agent claude
+```
+
+What happens on spawn:
+- Apex Manager prepares the worker directory.
+- If the repo is git-based, it creates a dedicated worktree.
+- It writes `.apex-manager/workers/T1/worker-protocol.md`.
+- It opens a worker terminal session.
+- It injects the kickoff instruction.
+- It verifies real activity such as `task claim`, `status.json`, or `result.json` before considering the launch successful.
+
+Start the daemon:
+
+```bash
+apex-manager orch start
+```
+
+Check live state:
+
+```bash
+apex-manager worker list
+apex-manager worker status T1
+apex-manager orch status
+apex-manager orch events --tail 20
+```
+
+Send manager messages:
+
+```bash
+apex-manager worker tell T1 "Please tighten the edge-case handling."
+apex-manager worker ask T1 "Did you cover the empty input path?" --wait-ack
+apex-manager worker inject T1 "Stop the current approach and switch to the new response shape." --urgent
+```
+
+Capture output:
+
+```bash
+apex-manager artifact submit T1 --by T1 --type report --path ./notes.md --summary "Implementation notes"
+apex-manager artifact list T1
+```
+
+Wrap up:
+
+```bash
+apex-manager worker merge T1
+apex-manager orch stop
+```
+
+## Command Surface
+
+Top-level commands:
+
+```bash
+apex-manager init
+apex-manager task ...
+apex-manager worker ...
+apex-manager artifact ...
+apex-manager msg ...
+apex-manager orch ...
+```
+
+Useful task commands:
+
+```bash
+apex-manager task create <title> [description...] [--depends <task-id>] [--agent <agent>] [--protocol <skill>] [--category <cat>]
+apex-manager task list
+apex-manager task status <task-id>
+apex-manager task claim <task-id> [--by <worker-id>]
+apex-manager task complete <task-id> [--by <worker-id>] [--summary <summary>] [--evidence <artifact-id>]
+apex-manager task block <task-id> --reason <reason> [--by <worker-id>]
+apex-manager task update <task-id> [--status <status>] [--agent <agent>] [--protocol <skill>]
+```
+
+Useful worker commands:
+
+```bash
+apex-manager worker spawn <task-id> [--agent <agent>] [--protocol <skill>] [--cross-model] [--dry-run]
+apex-manager worker list
+apex-manager worker status <task-id>
+apex-manager worker interrupt <task-id>
+apex-manager worker tell <task-id> <message> [--wait-ack]
+apex-manager worker ask <task-id> <question> [--wait-ack]
+apex-manager worker inject <task-id> <message> [--urgent]
+apex-manager worker merge <task-id> [--strategy local|pr|squash]
+apex-manager worker merge-all [--strategy local|pr|squash]
+apex-manager worker report
+apex-manager worker synthesize <task-id>
+```
+
+Useful daemon commands:
+
+```bash
 apex-manager orch start [--force]
 apex-manager orch stop
 apex-manager orch status
+apex-manager orch events [--tail <n>] [--type <event-type>]
+apex-manager orch snapshot [--rebuild]
 ```
 
-## Project Structure
+Useful low-level message commands:
 
-```
-apex-manager/
-├── src/
-│   ├── cli.ts                    # Entry point — command router
-│   ├── commands/
-│   │   ├── worker.ts             # spawn / kill / merge / interrupt / directive
-│   │   └── orch.ts               # Daemon lifecycle + lock management
-│   ├── daemon/
-│   │   ├── daemon.ts             # Tick loop: monitor → test → merge → spawn
-│   │   ├── integrate.ts          # Test-in-worktree + fast-forward merge
-│   │   └── notify.ts             # Plan Agent notification delivery
-│   ├── worker/
-│   │   ├── protocol-builder.ts   # Assembles work instructions per worker
-│   │   ├── agent-adapter.ts      # Agent-specific CLI knowledge
-│   │   ├── terminal.ts           # tmux / cmux abstraction
-│   │   ├── monitor.ts            # Health checks + status reading
-│   │   ├── cross-model.ts        # Multi-agent result synthesis
-│   │   ├── cost.ts               # Budget tracking + alerts
-│   │   └── proxy.ts              # Rate limit extraction
-│   ├── types/
-│   │   ├── config.ts             # Configuration schema + defaults
-│   │   └── task.ts               # Task model + status FSM
-│   └── utils/
-│       ├── config.ts             # YAML config loader
-│       ├── json.ts               # Atomic JSON read/write
-│       └── logger.ts             # Event logging
-├── roles/
-│   └── manager.md                # Plan Agent role definition
-├── SKILL.md                      # Skill activation guide
-├── package.json
-└── tsconfig.json
+```bash
+apex-manager msg send <to> <body> [--from <sender>] [--kind <directive|question|info>] [--priority <normal|urgent>] [--wait-ack]
+apex-manager msg list [--to <task-id>] [--status <pending|delivered|acked|ack_timeout|failed>]
+apex-manager msg show <message-id>
+apex-manager msg ack <message-id> [--by <worker-id>]
 ```
 
-## License
+## State Layout
 
-MIT
+All local state lives under `.apex-manager/`:
+
+```text
+.apex-manager/
+├── config.yaml
+├── agents.json
+├── tasks.json
+├── events.jsonl
+├── event-log.jsonl
+├── state.snapshot.json
+├── orch.lock
+├── orch.pid
+├── workers/
+├── worktrees/
+├── artifacts/
+│   └── index.json
+├── messages/
+│   └── index.json
+└── notifications/
+```
+
+Important worker files:
+
+```text
+.apex-manager/workers/T1/
+├── meta.json
+├── worker-protocol.md
+├── status.json
+├── result.json
+├── escalation.json
+└── directive.json
+```
+
+## Current Behavior That Matters
+
+These details are important in real use:
+
+- Protocol files are per worker, not shared.
+- Worker launch is not treated as successful just because a prompt is visible.
+- Normal messages can remain `pending` while a worker is busy.
+- Urgent messages can interrupt first and then inject.
+- Message IDs and message-store writes are protected against concurrent write races.
+- `tmux` workers outside an existing tmux session are opened in dedicated detached sessions so multiple GUI terminals do not all mirror the same shared window.
+- `cross-model` spawn uses the same kickoff and launch-verification path as normal spawn.
+
+## Known Limitations
+
+- Idle detection is heuristic. If upstream agent CLIs change their UI significantly, the ready/busy checks may need to be updated.
+- Non-git projects do not get safe isolation. Apex Manager will warn, but it cannot prevent parallel file conflicts in shared project-root mode.
+- Sandbox restrictions from the host runtime can still block access to `tmux` sockets or terminal control. That is an environment constraint, not always an Apex Manager bug.
+- Merge automation is local-CLI oriented. If your preferred workflow is GitHub PR-first, use `--strategy pr` where supported and verify the surrounding environment.
+
+## Development
+
+Install dependencies:
+
+```bash
+npm install
+```
+
+Run the CLI directly from source:
+
+```bash
+npx tsx src/cli.ts --help
+```
+
+Verify the repo:
+
+```bash
+npm run typecheck
+npm test
+```
+
+## Scope
+
+Apex Manager is not trying to be:
+- a hosted multi-agent platform
+- a generic browser UI
+- a replacement for your agent CLI
+
+It is a local orchestration layer around existing agent CLIs.

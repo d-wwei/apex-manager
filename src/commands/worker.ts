@@ -2,19 +2,27 @@ import { spawnSync } from "child_process";
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync } from "fs";
 import { join, resolve } from "path";
 import { readJSON, writeJSON } from "../utils/json.js";
-import { buildWorkerProtocol, agentStartCommand } from "../worker/protocol-builder.js";
-import { detectAdapter } from "../worker/terminal.js";
+import { buildWorkerProtocol, agentStartCommand, workerProtocolRelativePath } from "../worker/protocol-builder.js";
+import { adapterForHandle, detectAdapter } from "../worker/terminal.js";
 import type { Task, TaskStore } from "../types/task.js";
 import type { ProtocolBuildOptions } from "../worker/protocol-builder.js";
 import type { WorkerMeta, WorkerResult } from "../worker/monitor.js";
+import type { AgentAdapter } from "../worker/agent-adapter.js";
+import type { TerminalAdapter, WindowHandle } from "../worker/terminal.js";
 import { spawnCrossModel, parseCrossModelArgs, synthesizeResults } from "../worker/cross-model.js";
 import { listWorkers, checkWorkerHealth, getMonitorReport } from "../worker/monitor.js";
 import { formatCostReport, formatRateLimitStatus } from "../worker/cost.js";
 import { readCostSummary, readRateLimit } from "../worker/proxy.js";
 import { loadConfig } from "../utils/config.js";
+import { recordKernelEvent } from "../utils/events.js";
 import { checkAgent, checkAllAgents } from "../worker/capability-check.js";
 import { loadAgentsConfig, resolveAdapterWithConfig } from "../worker/agent-adapter.js";
 import { interruptKeys } from "../worker/interrupt.js";
+import { sendStructuredMessage } from "../worker/messages.js";
+import { isWorkerIdleScreen, waitForWorkerIdle } from "../worker/idle.js";
+import { buildWorkerKickoffMessage, ensureKickoffSubmitted, verifyWorkerLaunch, waitForKickoffReady } from "../worker/launch.js";
+
+export { buildWorkerKickoffMessage } from "../worker/launch.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -59,8 +67,21 @@ function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
 }
 
+function flagValue(args: string[], flag: string): string | undefined {
+  const idx = args.indexOf(flag);
+  return idx >= 0 && args[idx + 1] ? args[idx + 1] : undefined;
+}
+
 function findTask(tasks: Task[], taskId: string): Task | undefined {
   return tasks.find((t) => t.id === taskId);
+}
+
+function workerRuntimeDir(worktreePath: string, taskId: string): string {
+  return join(worktreePath, ".apex-manager", "workers", taskId);
+}
+
+function workerControlDir(projectRoot: string, taskId: string): string {
+  return join(projectRoot, ".apex-manager", "workers", taskId);
 }
 
 // WorkerMeta imported from ../worker/monitor.js
@@ -73,7 +94,7 @@ async function cmdSpawn(args: string[]): Promise<void> {
   const agentValueIdx = agentIdx >= 0 ? agentIdx + 1 : -1;
   const taskId = args.find((a, i) => !a.startsWith("--") && i !== agentValueIdx);
   if (!taskId) {
-    console.error("Usage: apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--cross-model] [--dry-run]");
+    console.error("Usage: apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--protocol <skill>] [--cross-model] [--dry-run]");
     process.exit(1);
   }
 
@@ -142,8 +163,8 @@ async function cmdSpawn(args: string[]): Promise<void> {
       }
     }
   } else {
-    // Non-git repo: no worktree isolation, work directly in project root
-    console.warn(`[warn] Not a git repository — worker will run in project root (no isolation)`);
+    // Non-git repo: no worktree isolation, work directly in project root.
+    console.warn(`[warn] ${taskId}: current directory is not a git repository. Falling back to shared project-root execution without worktree isolation. Parallel edits may conflict; prefer running apex-manager from a real repo root.`);
     worktreeRel = ".";
     worktreePath = projectRoot;
     branch = "";
@@ -170,16 +191,24 @@ async function cmdSpawn(args: string[]): Promise<void> {
     completedDeps,
     crossModel,
     agent,
+    protocol: flagValue(args, "--protocol") ?? task.protocol,
     isolated,
   };
 
-  const protocol = buildWorkerProtocol(opts);
-  const protocolPath = join(worktreeApex, "worker-protocol.md");
-  writeFileSync(protocolPath, protocol);
-
   // 6. Write worker registration
-  const workersDir = join(projectRoot, ".apex-manager", "workers", taskId);
+  const workersDir = workerControlDir(projectRoot, taskId);
   mkdirSync(workersDir, { recursive: true });
+  const runtimeWorkerDir = workerRuntimeDir(worktreePath, taskId);
+  mkdirSync(runtimeWorkerDir, { recursive: true });
+
+  const protocol = buildWorkerProtocol(opts);
+  const protocolRelPath = workerProtocolRelativePath(taskId);
+  const runtimeProtocolPath = join(runtimeWorkerDir, "worker-protocol.md");
+  const controlProtocolPath = join(workersDir, "worker-protocol.md");
+  writeFileSync(runtimeProtocolPath, protocol);
+  if (resolve(runtimeProtocolPath) !== resolve(controlProtocolPath)) {
+    writeFileSync(controlProtocolPath, protocol);
+  }
 
   const meta: WorkerMeta = {
     task_id: taskId,
@@ -189,14 +218,21 @@ async function cmdSpawn(args: string[]): Promise<void> {
     started_at: new Date().toISOString(),
     agent,
     execution_mode: agentAdapter.executionMode,
+    isolation_mode: isolated ? "git-worktree" : "project-root",
+    launch_verification: {
+      state: "pending",
+    },
   };
 
   await writeJSON(join(workersDir, "meta.json"), meta);
 
   // 7. Dry-run: print protocol and exit
   if (isDryRun) {
-    console.log(`[dry-run] Protocol generated at ${protocolPath}`);
-    console.log(`[dry-run] Agent: ${agent}, Worktree: ${worktreeRel}`);
+    console.log(`[dry-run] Protocol generated at ${runtimeProtocolPath}`);
+    if (resolve(runtimeProtocolPath) !== resolve(controlProtocolPath)) {
+      console.log(`[dry-run] Control-plane copy at ${controlProtocolPath}`);
+    }
+    console.log(`[dry-run] Agent: ${agent}, Worktree: ${worktreeRel}, Isolation: ${meta.isolation_mode}`);
     console.log(protocol);
     return;
   }
@@ -204,24 +240,47 @@ async function cmdSpawn(args: string[]): Promise<void> {
   // 8. Create terminal window
   const slug = toSlug(task.title);
   const windowName = `${taskId}-${slug}`;
-  const command = await agentStartCommand(agent, worktreePath);
+  const command = await agentStartCommand(agent, worktreePath, protocolRelPath);
 
   const terminal = detectAdapter();
   const handle = await terminal.createWindow(windowName, command);
 
-  // 9. Post-create protocol injection for agents that need it
-  if (agentAdapter.needsPostCreateSend) {
-    // Wait for agent CLI to start, then send the protocol read instruction
-    await new Promise((r) => setTimeout(r, 3000));
-    const relProtocol = ".apex-manager/worker-protocol.md";
-    await terminal.send(handle, `Read the file ${relProtocol} and execute all tasks described in it. This is your complete work instruction.`);
-  }
-
-  // 10. Update meta with window handle
+  // 9. Update meta with window handle immediately so monitoring can diagnose startup failures
   meta.window_handle = handle;
   await writeJSON(join(workersDir, "meta.json"), meta);
+  await recordKernelEvent({
+    type: "worker.registered",
+    timestamp: new Date().toISOString(),
+    worker: { ...meta },
+  });
 
-  // 11. Print confirmation
+  // 10. Kick off the worker once the interactive CLI is ready.
+  const kickoffMessage = buildWorkerKickoffMessage(agentAdapter, protocolRelPath);
+  if (kickoffMessage) {
+    await waitForKickoffReady(taskId, agent, terminal, handle);
+    await terminal.send(handle, kickoffMessage);
+    await ensureKickoffSubmitted(taskId, agent, terminal, handle, kickoffMessage);
+  }
+
+  // 11. Verify actual launch activity, not just a visible prompt.
+  const verification = await verifyWorkerLaunch(projectRoot, taskId, taskId, terminal, handle);
+  meta.launch_verification = verification;
+  await writeJSON(join(workersDir, "meta.json"), meta);
+  await recordKernelEvent({
+    type: verification.state === "verified" ? "worker.launch_verified" : "worker.launch_failed",
+    timestamp: verification.checked_at ?? new Date().toISOString(),
+    worker_id: taskId,
+    verification,
+  });
+
+  if (verification.state === "verified") {
+    console.log(`[smoke] ${taskId}: ${verification.action_signal}${verification.note ? `; ${verification.note}` : ""}${verification.screen_summary ? `; screen=${verification.screen_summary}` : ""}`);
+  } else {
+    console.error(`[smoke] ${taskId}: launch verification failed. ${verification.note ?? "No activity detected."}${verification.screen_summary ? ` screen=${verification.screen_summary}` : ""}`);
+    process.exit(1);
+  }
+
+  // 12. Print confirmation
   console.log(`Worker ${taskId} spawned in window ${windowName} (agent: ${agent}, worktree: ${worktreeRel})`);
 }
 
@@ -255,7 +314,7 @@ async function cmdKill(args: string[]): Promise<void> {
   // 2. Close terminal window if handle exists
   if (meta.window_handle) {
     try {
-      const adapter = detectAdapter();
+      const adapter = adapterForHandle(meta.window_handle);
       await adapter.close(meta.window_handle);
     } catch {
       // Window may already be closed -- proceed with cleanup
@@ -272,6 +331,11 @@ async function cmdKill(args: string[]): Promise<void> {
   // 4. Remove worker directory
   const workersDir = join(projectRoot, ".apex-manager", "workers", taskId);
   rmSync(workersDir, { recursive: true, force: true });
+  await recordKernelEvent({
+    type: "worker.removed",
+    timestamp: new Date().toISOString(),
+    worker_id: taskId,
+  });
 
   // 5. Print confirmation
   console.log(`Worker ${taskId} killed and cleaned up`);
@@ -308,7 +372,7 @@ async function cmdInterrupt(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const terminal = detectAdapter();
+  const terminal = adapterForHandle(meta.window_handle);
   const adapterName = terminal.name() as "cmux" | "tmux";
   // Read interrupt type from agent config; fall back to "esc" for unknown agents
   const agentsCfg = loadAgentsConfig();
@@ -339,14 +403,7 @@ async function cmdInterrupt(args: string[]): Promise<void> {
 }
 
 function isAgentIdle(screen: string, agent: string): boolean {
-  switch (agent) {
-    case "claude":
-      return screen.includes("\u276f") && !screen.includes("esc to interrupt");
-    case "codex":
-    case "gemini":
-    default:
-      return screen.includes("$") || screen.includes("\u276f");
-  }
+  return isWorkerIdleScreen(screen, agent);
 }
 
 // ── directive ──────────────────────────────────────────────────────
@@ -392,6 +449,59 @@ export async function cmdDirective(args: string[]): Promise<void> {
 
   writeFileSync(join(workerDir, "directive.json"), JSON.stringify(directive, null, 2));
   console.log(`Directive written: ${action} → Worker ${taskId}${urgent ? " (urgent)" : ""}`);
+}
+
+async function cmdTellLike(
+  args: string[],
+  kind: "directive" | "question",
+  directiveAction: "amend" | "info",
+): Promise<void> {
+  const taskId = args[0];
+  const body = args.slice(1).filter((arg) => !arg.startsWith("--")).join(" ");
+  const waitForAck = hasFlag(args, "--wait-ack");
+
+  if (!taskId || !body) {
+    console.error(`Usage: apex-manager worker ${kind === "question" ? "ask" : "tell"} <task-id> <message> [--wait-ack]`);
+    process.exit(1);
+  }
+
+  const message = await sendStructuredMessage({
+    from: "manager",
+    to: taskId,
+    taskId,
+    kind,
+    priority: "normal",
+    ackRequired: true,
+    body,
+    directiveAction,
+    waitForAck,
+  });
+
+  console.log(`${message.id} ${message.delivery_status} for ${taskId}`);
+}
+
+async function cmdInject(args: string[]): Promise<void> {
+  const taskId = args[0];
+  const body = args.slice(1).filter((arg) => !arg.startsWith("--")).join(" ");
+  const urgent = hasFlag(args, "--urgent");
+
+  if (!taskId || !body) {
+    console.error("Usage: apex-manager worker inject <task-id> <message> [--urgent]");
+    process.exit(1);
+  }
+
+  const message = await sendStructuredMessage({
+    from: "manager",
+    to: taskId,
+    taskId,
+    kind: "directive",
+    priority: urgent ? "urgent" : "normal",
+    ackRequired: true,
+    body,
+    directiveAction: "amend",
+  });
+
+  console.log(`${message.id} ${message.delivery_status} for ${taskId}`);
 }
 
 // ── merge ───────────────────────────────────────────────────────────
@@ -598,10 +708,16 @@ function printHelp(): void {
 apex-manager worker — manage parallel worker agents
 
 Usage:
-  apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--cross-model] [--dry-run]
+  apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--protocol <skill>] [--cross-model] [--dry-run]
                                 Spawn a worker agent for a task
   apex-manager worker kill <task-id>    Kill worker and clean up worktree
   apex-manager worker interrupt <task-id> Send interrupt signal to worker
+  apex-manager worker tell <task-id> <message> [--wait-ack]
+                                Send a structured manager message to a worker
+  apex-manager worker ask <task-id> <question> [--wait-ack]
+                                Send a structured question to a worker
+  apex-manager worker inject <task-id> <message> [--urgent]
+                                Inject a structured directive with terminal delivery
   apex-manager worker directive <task-id> <action> <content> [--urgent]
                                 Write directive.json (action: amend|pause|abort|info)
   apex-manager worker merge <task-id> [--strategy local|pr|squash]
@@ -633,6 +749,15 @@ export async function cmdWorker(args: string[]): Promise<void> {
     case "interrupt":
       await cmdInterrupt(args.slice(1));
       break;
+    case "tell":
+      await cmdTellLike(args.slice(1), "directive", "info");
+      break;
+    case "ask":
+      await cmdTellLike(args.slice(1), "question", "info");
+      break;
+    case "inject":
+      await cmdInject(args.slice(1));
+      break;
     case "directive":
       await cmdDirective(args.slice(1));
       break;
@@ -656,6 +781,7 @@ export async function cmdWorker(args: string[]): Promise<void> {
         const health = await checkWorkerHealth(w.meta.task_id);
         let status: string;
         if (health.completed) status = "completed";
+        else if (health.starting) status = "STARTING";
         else if (health.crashed) status = "CRASHED";
         else if (health.exitedWithoutResult) status = "EXITED (no result)";
         else if (health.stale) status = "STALE";
@@ -663,8 +789,9 @@ export async function cmdWorker(args: string[]): Promise<void> {
         else status = "unknown";
         const stage = w.status?.stage ?? "\u2014";
         const started = timeAgo(w.meta.started_at);
+        const launchPrefix = w.meta.launch_verification?.state === "failed" ? "!" : " ";
         console.log(
-          `  ${w.meta.task_id.padEnd(9)}${w.meta.agent.padEnd(11)}${stage.padEnd(13)}${status.padEnd(13)}${started}`,
+          `${launchPrefix} ${w.meta.task_id.padEnd(8)}${w.meta.agent.padEnd(11)}${stage.padEnd(13)}${status.padEnd(13)}${started}`,
         );
       }
       break;
@@ -692,6 +819,7 @@ export async function cmdWorker(args: string[]): Promise<void> {
       }
       let statusLabel: string;
       if (health.completed) statusLabel = "completed";
+      else if (health.starting) statusLabel = "STARTING";
       else if (health.crashed) statusLabel = "CRASHED";
       else if (health.exitedWithoutResult) statusLabel = "EXITED (no result)";
       else if (health.stale) statusLabel = "STALE";
@@ -702,8 +830,18 @@ export async function cmdWorker(args: string[]): Promise<void> {
         `  Stage: ${info.status?.stage ?? "\u2014"}`,
         `  Progress: ${info.status?.progress ?? "\u2014"}`,
         `  Health: ${statusLabel}`,
+        `  Isolation: ${info.meta.isolation_mode ?? "git-worktree"}`,
         `  Started: ${timeAgo(info.meta.started_at)}`,
       ];
+      if (info.meta.launch_verification) {
+        lines.push(`  Launch verification: ${info.meta.launch_verification.state}`);
+        if (info.meta.launch_verification.action_signal) {
+          lines.push(`  Launch signal: ${info.meta.launch_verification.action_signal}`);
+        }
+        if (info.meta.launch_verification.note) {
+          lines.push(`  Launch note: ${info.meta.launch_verification.note}`);
+        }
+      }
       if (info.status?.last_activity) {
         lines.push(`  Last activity: ${timeAgo(info.status.last_activity)}`);
       }

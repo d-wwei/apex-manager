@@ -10,11 +10,13 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, readdirSync } from 
 import { join, resolve } from "path";
 import { spawnSync } from "child_process";
 import { readJSON, writeJSON } from "../utils/json.js";
-import { buildWorkerProtocol, agentStartCommand } from "./protocol-builder.js";
+import { buildWorkerProtocol, agentStartCommand, workerProtocolRelativePath } from "./protocol-builder.js";
 import { detectAdapter, type WindowHandle } from "./terminal.js";
-import type { WorkerResult } from "./monitor.js";
+import type { WorkerMeta, WorkerResult } from "./monitor.js";
 import type { TaskStore } from "../types/task.js";
 import type { ProtocolBuildOptions } from "./protocol-builder.js";
+import { loadAgentsConfig, resolveAdapterWithConfig } from "./agent-adapter.js";
+import { buildWorkerKickoffMessage, ensureKickoffSubmitted, verifyWorkerLaunch, waitForKickoffReady } from "./launch.js";
 
 // Re-export type for findings used in deduplication
 export interface FindingLike {
@@ -116,31 +118,59 @@ export async function spawnCrossModel(
       agent,
     };
     const protocol = buildWorkerProtocol(opts);
-    writeFileSync(join(worktreeAM, "worker-protocol.md"), protocol);
 
     // Register worker
     const workersDir = join(projectRoot, ".apex-manager", "workers", subId);
     mkdirSync(workersDir, { recursive: true });
-    const meta = {
+    const runtimeWorkersDir = join(worktreePath, ".apex-manager", "workers", subId);
+    mkdirSync(runtimeWorkersDir, { recursive: true });
+    const protocolRelPath = workerProtocolRelativePath(subId);
+    const runtimeProtocolPath = join(runtimeWorkersDir, "worker-protocol.md");
+    const controlProtocolPath = join(workersDir, "worker-protocol.md");
+    writeFileSync(runtimeProtocolPath, protocol);
+    if (resolve(runtimeProtocolPath) !== resolve(controlProtocolPath)) {
+      writeFileSync(controlProtocolPath, protocol);
+    }
+
+    const meta: WorkerMeta = {
       task_id: subId,
       window_handle: null as WindowHandle | null,
       worktree_path: worktreeRel,
       branch,
       started_at: new Date().toISOString(),
       agent,
+      isolation_mode: "git-worktree",
+      launch_verification: {
+        state: "pending",
+      },
     };
     await writeJSON(join(workersDir, "meta.json"), meta);
 
     if (isDryRun) {
-      console.log(`[dry-run] ${subId}: agent=${agent}, worktree=${worktreeRel}`);
+      console.log(`[dry-run] ${subId}: agent=${agent}, worktree=${worktreeRel}, protocol=${runtimeProtocolPath}`);
       continue;
     }
 
     // Launch terminal
     const adapter = detectAdapter();
-    const handle = await adapter.createWindow(`${subId}`, await agentStartCommand(agent, worktreePath));
+    const handle = await adapter.createWindow(`${subId}`, await agentStartCommand(agent, worktreePath, protocolRelPath));
     meta.window_handle = handle;
     await writeJSON(join(workersDir, "meta.json"), meta);
+
+    const agentAdapter = resolveAdapterWithConfig(agent, loadAgentsConfig());
+    const kickoffMessage = buildWorkerKickoffMessage(agentAdapter, protocolRelPath);
+    if (kickoffMessage) {
+      await waitForKickoffReady(subId, agent, adapter, handle);
+      await adapter.send(handle, kickoffMessage);
+      await ensureKickoffSubmitted(subId, agent, adapter, handle, kickoffMessage);
+    }
+
+    meta.launch_verification = await verifyWorkerLaunch(projectRoot, subId, null, adapter, handle);
+    await writeJSON(join(workersDir, "meta.json"), meta);
+    if (meta.launch_verification.state !== "verified") {
+      console.error(`[smoke] ${subId}: launch verification failed. ${meta.launch_verification.note ?? "No activity detected."}`);
+      process.exit(1);
+    }
   }
 
   console.log(`Cross-model spawn: ${ids.length} workers for ${taskId}`);

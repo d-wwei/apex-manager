@@ -11,7 +11,7 @@
  */
 
 import { existsSync, readFileSync } from "fs";
-import { join } from "path";
+import { basename, join } from "path";
 import type { Task } from "../types/task.js";
 import { resolveAdapterWithConfig, loadAgentsConfig } from "./agent-adapter.js";
 import type { AgentCapabilities } from "./agent-adapter.js";
@@ -28,6 +28,10 @@ export interface ProtocolBuildOptions {
   crossModel?: boolean;
   /** false when running in a non-git repo without worktree isolation */
   isolated?: boolean;
+}
+
+export function workerProtocolRelativePath(taskId: string): string {
+  return `.apex-manager/workers/${taskId}/worker-protocol.md`;
 }
 
 // ── Skill lookup ─────────────────────────────────────────────────────
@@ -150,6 +154,10 @@ and return control to the Plan Agent for re-splitting.`;
 function fullBashCommunication(
   task: Task, workersDir: string, projectRoot: string, lang: "zh" | "en",
 ): string {
+  const claimBlock = `\
+\`\`\`bash
+cd ${projectRoot} && apex-manager task claim ${task.id} --by ${task.id}
+\`\`\``;
   const statusBlock = `\
 \`\`\`bash
 cat > ${workersDir}/status.json << 'APEX_EOF'
@@ -177,24 +185,27 @@ cat > ${workersDir}/result.json << 'APEX_EOF'
 }
 APEX_EOF
 
-cd ${projectRoot} && apex-manager task submit ${task.id} "<evidence description>"
-cd ${projectRoot} && apex-manager task verify ${task.id} pass
+cd ${projectRoot} && apex-manager task complete ${task.id} --by ${task.id} --summary "<what you accomplished>"
+
+# Optional: when you produced a reusable file artifact
+cd ${projectRoot} && apex-manager artifact submit ${task.id} --by ${task.id} --type report --path "<path-to-file>" --summary "<artifact summary>"
 \`\`\``;
 
   const blockBlock = `\
 \`\`\`bash
-cd ${projectRoot} && apex-manager task block ${task.id} "<reason>"
+cd ${projectRoot} && apex-manager task block ${task.id} --by ${task.id} --reason "<reason>"
 \`\`\``;
 
   const header = lang === "en" ? "## Communication Protocol" : "## 通信协议";
   const intro = lang === "en"
     ? "You work in an isolated worktree. Report status to the main project:"
     : "你在独立的 worktree 中工作。需要向主项目报告状态:";
+  const startH = lang === "en" ? "### At Start" : "### 开始时";
   const progressH = lang === "en" ? "### Progress Update (after each sub-task)" : "### 进度更新 (每完成一个子任务)";
   const completeH = lang === "en" ? "### On Completion" : "### 完成时";
   const blockedH = lang === "en" ? "### When Blocked" : "### 遇到阻塞时";
 
-  return `${header}\n\n${intro}\n\n${progressH}\n\n${statusBlock}\n\n${completeH}\n\n${resultBlock}\n\n${blockedH}\n\n${blockBlock}`;
+  return `${header}\n\n${intro}\n\n${startH}\n\n${claimBlock}\n\n${progressH}\n\n${statusBlock}\n\n${completeH}\n\n${resultBlock}\n\n${blockedH}\n\n${blockBlock}`;
 }
 
 function fileWriteCommunication(
@@ -223,6 +234,12 @@ function fileWriteCommunication(
 
 You work in an isolated worktree. Report status to the main project:
 
+### At Start
+
+Run:
+
+- \`cd ${projectRoot} && apex-manager task claim ${task.id} --by ${task.id}\`
+
 ### Progress Update (after each sub-task)
 
 Write the following JSON to \`${workersDir}/status.json\`:
@@ -241,18 +258,27 @@ ${resultJson}
 
 Then run:
 
-- \`cd ${projectRoot} && apex-manager task submit ${task.id} "<evidence description>"\`
-- \`cd ${projectRoot} && apex-manager task verify ${task.id} pass\`
+- \`cd ${projectRoot} && apex-manager task complete ${task.id} --by ${task.id} --summary "<what you accomplished>"\`
+
+If you produced a reusable file, also run:
+
+- \`cd ${projectRoot} && apex-manager artifact submit ${task.id} --by ${task.id} --type report --path "<path-to-file>" --summary "<artifact summary>"\`
 
 ### When Blocked
 
-Run: \`cd ${projectRoot} && apex-manager task block ${task.id} "<reason>"\``;
+Run: \`cd ${projectRoot} && apex-manager task block ${task.id} --by ${task.id} --reason "<reason>"\``;
   }
 
   return `\
 ## 通信协议
 
 你在独立的 worktree 中工作。需要向主项目报告状态:
+
+### 开始时
+
+运行:
+
+- \`cd ${projectRoot} && apex-manager task claim ${task.id} --by ${task.id}\`
 
 ### 进度更新 (每完成一个子任务)
 
@@ -272,12 +298,15 @@ ${resultJson}
 
 然后运行:
 
-- \`cd ${projectRoot} && apex-manager task submit ${task.id} "<evidence description>"\`
-- \`cd ${projectRoot} && apex-manager task verify ${task.id} pass\`
+- \`cd ${projectRoot} && apex-manager task complete ${task.id} --by ${task.id} --summary "<what you accomplished>"\`
+
+如果你产出了可复用文件，再额外运行:
+
+- \`cd ${projectRoot} && apex-manager artifact submit ${task.id} --by ${task.id} --type report --path "<path-to-file>" --summary "<artifact summary>"\`
 
 ### 遇到阻塞时
 
-运行: \`cd ${projectRoot} && apex-manager task block ${task.id} "<reason>"\``;
+运行: \`cd ${projectRoot} && apex-manager task block ${task.id} --by ${task.id} --reason "<reason>"\``;
 }
 
 function minimalCommunication(
@@ -607,11 +636,15 @@ export function generateWorkerProtocol(opts: ProtocolBuildOptions): string {
 
 // ── Agent start command ──────────────────────────────────────────────
 
-export async function agentStartCommand(agent: string, worktreePath: string): Promise<string> {
+export async function agentStartCommand(
+  agent: string,
+  worktreePath: string,
+  protocolPath = workerProtocolRelativePath(basename(worktreePath)),
+): Promise<string> {
   const agents = loadAgentsConfig();
   const adapter = resolveAdapterWithConfig(agent, agents);
   return adapter.buildStartCommand({
     worktreePath,
-    protocolPath: ".apex-manager/worker-protocol.md",
+    protocolPath,
   });
 }

@@ -6,7 +6,7 @@
  */
 
 import { spawnSync, execSync } from "child_process";
-import { appendJSONL } from "../utils/logger.js";
+import { recordKernelEvent } from "../utils/events.js";
 
 export interface IntegrateResult {
   ok: boolean;
@@ -37,9 +37,10 @@ export async function autoIntegrate(taskId: string): Promise<IntegrateResult> {
       cwd: tmpWorktree,
     });
     if (mergeResult.status !== 0) {
-      appendJSONL(".apex-manager/event-log.jsonl", {
+      await recordKernelEvent({
         type: "orchestration.event",
-        action: "integrate_conflict", task: taskId,
+        action: "integrate_conflict",
+        task_id: taskId,
         timestamp: new Date().toISOString(),
       });
       return { ok: false, reason: "merge_conflict", output: mergeResult.stderr };
@@ -52,9 +53,10 @@ export async function autoIntegrate(taskId: string): Promise<IntegrateResult> {
       timeout: 120_000, // 2 minute timeout for tests
     });
     if (testResult.status !== 0) {
-      appendJSONL(".apex-manager/event-log.jsonl", {
+      await recordKernelEvent({
         type: "orchestration.event",
-        action: "integrate_failed", task: taskId,
+        action: "integrate_failed",
+        task_id: taskId,
         timestamp: new Date().toISOString(),
       });
       return { ok: false, reason: "test_failure", output: testResult.stdout };
@@ -78,19 +80,20 @@ export async function autoMerge(taskId: string): Promise<boolean> {
 
   if (mergeResult.status !== 0) {
     // Main branch moved between integrate and merge — caller should re-integrate
-    appendJSONL(".apex-manager/event-log.jsonl", {
+    await recordKernelEvent({
       type: "orchestration.event",
-      action: "merge_race_retry", task: taskId,
+      action: "merge_race_retry",
+      task_id: taskId,
       timestamp: new Date().toISOString(),
     });
     return false;
   }
 
   const commitHash = execSync("git rev-parse HEAD", { encoding: "utf-8" }).trim();
-  appendJSONL(".apex-manager/event-log.jsonl", {
+  await recordKernelEvent({
     type: "orchestration.event",
     action: "merge_completed",
-    task: taskId,
+    task_id: taskId,
     commit: commitHash,
     timestamp: new Date().toISOString(),
   });

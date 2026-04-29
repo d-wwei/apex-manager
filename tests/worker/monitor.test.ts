@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, rmSync, writeFileSync } from "fs";
+import { chmodSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 
@@ -17,6 +17,7 @@ import {
 
 let testDir: string;
 let originalCwd: string;
+let originalPath: string | undefined;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -63,10 +64,20 @@ function makeResult(overrides: Partial<WorkerResult> = {}): WorkerResult {
   };
 }
 
+function installFakeCmux(script: string): void {
+  const binDir = join(testDir, "bin");
+  mkdirSync(binDir, { recursive: true });
+  const scriptPath = join(binDir, "cmux");
+  writeFileSync(scriptPath, script);
+  chmodSync(scriptPath, 0o755);
+  process.env.PATH = `${binDir}:${originalPath ?? ""}`;
+}
+
 // ── Setup / Teardown ───────────────────────────────────────────────
 
 beforeEach(() => {
   originalCwd = process.cwd();
+  originalPath = process.env.PATH;
   testDir = join(tmpdir(), `am-test-monitor-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   mkdirSync(testDir, { recursive: true });
   process.chdir(testDir);
@@ -75,6 +86,7 @@ beforeEach(() => {
 
 afterEach(() => {
   process.chdir(originalCwd);
+  process.env.PATH = originalPath;
   rmSync(testDir, { recursive: true, force: true });
 });
 
@@ -180,12 +192,29 @@ describe("checkWorkerHealth", () => {
 
   it("crashed when PID is dead and no result", async () => {
     // PID 2147483647 should not exist
-    writeWorkerFile("T1", "meta.json", makeMeta("T1", { pid: 2147483647, window_handle: null }));
+    writeWorkerFile("T1", "meta.json", makeMeta("T1", {
+      pid: 2147483647,
+      window_handle: null,
+      started_at: new Date(Date.now() - 30_000).toISOString(),
+    }));
 
     const health = await checkWorkerHealth("T1");
     // No result.json + dead PID = crashed
     assert.strictEqual(health.crashed, true);
     assert.strictEqual(health.alive, false);
+  });
+
+  it("treats a fresh worker with no heartbeat as starting instead of crashed", async () => {
+    writeWorkerFile("T1", "meta.json", makeMeta("T1", {
+      pid: 2147483647,
+      window_handle: null,
+      started_at: new Date().toISOString(),
+    }));
+
+    const health = await checkWorkerHealth("T1");
+    assert.strictEqual(health.starting, true);
+    assert.strictEqual(health.crashed, false);
+    assert.strictEqual(health.exitedWithoutResult, false);
   });
 
   it("not crashed when no PID and no window_handle (ambiguous, defaults not crashed)", async () => {
@@ -199,6 +228,36 @@ describe("checkWorkerHealth", () => {
 
   it("throws when worker does not exist", async () => {
     await assert.rejects(() => checkWorkerHealth("NONEXISTENT"));
+  });
+
+  it("uses the recorded cmux adapter to collect screen tail diagnostics", async () => {
+    installFakeCmux(`#!/bin/sh
+case "$1" in
+  read-screen)
+    echo "last visible cmux line"
+    exit 0
+    ;;
+  validate-surface)
+    exit 1
+    ;;
+  --version|ping)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`);
+
+    writeWorkerFile("T1", "meta.json", makeMeta("T1", {
+      pid: 2147483647,
+      window_handle: { id: "surface-7", name: "T1-auth", adapter: "cmux" },
+      started_at: new Date(Date.now() - 30_000).toISOString(),
+    }));
+
+    const health = await checkWorkerHealth("T1");
+    assert.strictEqual(health.crashed, true);
+    assert.strictEqual(health.screenTail, "last visible cmux line");
   });
 });
 
@@ -230,11 +289,27 @@ describe("getMonitorReport", () => {
   });
 
   it("shows CRASHED status for dead worker", async () => {
-    writeWorkerFile("T1", "meta.json", makeMeta("T1", { pid: 2147483647, window_handle: null }));
+    writeWorkerFile("T1", "meta.json", makeMeta("T1", {
+      pid: 2147483647,
+      window_handle: null,
+      started_at: new Date(Date.now() - 30_000).toISOString(),
+    }));
 
     const report = await getMonitorReport();
     assert.ok(report.includes("T1"));
     assert.ok(report.includes("CRASHED"));
+  });
+
+  it("shows STARTING status before the first heartbeat grace window expires", async () => {
+    writeWorkerFile("T1", "meta.json", makeMeta("T1", {
+      pid: 2147483647,
+      window_handle: null,
+      started_at: new Date().toISOString(),
+    }));
+
+    const report = await getMonitorReport();
+    assert.ok(report.includes("T1"));
+    assert.ok(report.includes("STARTING"));
   });
 
   it("shows STALE status for inactive worker", async () => {

@@ -80,7 +80,9 @@ describe("buildWorkerProtocol", () => {
     assert.ok(md.includes("/home/user/myproject/.apex-manager/workers/T3/status.json"));
     assert.ok(!md.includes("/home/user/myproject/.apex/workers/T3/status.json"), "Must not contain .apex/ path");
     // apex commands
-    assert.ok(md.includes("apex-manager task submit T3"));
+    assert.ok(md.includes("apex-manager task claim T3 --by T3"));
+    assert.ok(md.includes("apex-manager task complete T3 --by T3"));
+    assert.ok(md.includes("apex-manager artifact submit T3 --by T3"));
   });
 
   it("includes Plan Agent directive check section", () => {
@@ -191,6 +193,7 @@ describe("agentStartCommand", () => {
     const cmd = await agentStartCommand("claude", worktree);
     assert.ok(cmd.includes("claude"));
     assert.ok(cmd.includes("--append-system-prompt-file"));
+    assert.ok(cmd.includes(".apex-manager/workers/T3/worker-protocol.md"));
     assert.ok(cmd.includes(worktree));
   });
 
@@ -198,6 +201,8 @@ describe("agentStartCommand", () => {
     const cmd = await agentStartCommand("codex", worktree);
     assert.ok(cmd.includes("codex"));
     assert.ok(cmd.includes("--full-auto"));
+    assert.ok(cmd.includes("-a never"));
+    assert.ok(cmd.includes("-s danger-full-access"));
     assert.ok(!cmd.includes("exec"), "should not use one-shot exec mode");
     assert.ok(cmd.includes(worktree));
   });
@@ -242,7 +247,9 @@ describe("sectionCommunication — capability degradation", () => {
     const result = sectionCommunicationForCapabilities(commOpts, "en", fullCaps);
     assert.ok(result.includes("cat >"));
     assert.ok(result.includes("APEX_EOF"));
-    assert.ok(result.includes("apex-manager task submit"));
+    assert.ok(result.includes("apex-manager task claim"));
+    assert.ok(result.includes("apex-manager task complete"));
+    assert.ok(result.includes("apex-manager artifact submit"));
   });
 
   it("file-write mode uses Write instructions, no heredoc", () => {
@@ -283,15 +290,17 @@ describe("sectionCommunication — capability degradation", () => {
 
   it("file-write mode includes apex CLI as Run instructions", () => {
     const result = sectionCommunicationForCapabilities(commOpts, "en", fileWriteCaps);
-    assert.ok(result.includes("apex-manager task submit"));
-    assert.ok(result.includes("apex-manager task verify"));
+    assert.ok(result.includes("apex-manager task claim"));
+    assert.ok(result.includes("apex-manager task complete"));
     assert.ok(result.includes("apex-manager task block"));
+    assert.ok(result.includes("apex-manager artifact submit"));
   });
 
   it("minimal mode excludes all apex CLI commands", () => {
     const result = sectionCommunicationForCapabilities(commOpts, "en", minimalCaps);
-    assert.ok(!result.includes("apex task submit"));
-    assert.ok(!result.includes("apex task verify"));
-    assert.ok(!result.includes("apex task block"));
+    assert.ok(!result.includes("apex-manager task claim"));
+    assert.ok(!result.includes("apex-manager task complete"));
+    assert.ok(!result.includes("apex-manager task block"));
+    assert.ok(!result.includes("apex-manager artifact submit"));
   });
 });

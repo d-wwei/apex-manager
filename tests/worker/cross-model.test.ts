@@ -1,9 +1,14 @@
-import { describe, it } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
+import { spawnSync } from "child_process";
 import {
   generateCrossModelIds,
   mergeVerdicts,
   deduplicateFindings,
+  spawnCrossModel,
 } from "../../src/worker/cross-model.js";
 
 describe("generateCrossModelIds", () => {
@@ -98,5 +103,110 @@ describe("deduplicateFindings", () => {
     ];
     const result = deduplicateFindings(findings);
     assert.strictEqual(result.length, 3);
+  });
+});
+
+describe("spawnCrossModel", () => {
+  let tmpDir: string;
+  let origCwd: string;
+  let origPath: string | undefined;
+  let origCmuxSurface: string | undefined;
+  let origCmuxLog: string | undefined;
+  let origApexTestRoot: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = join(tmpdir(), `am-cross-model-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(tmpDir, { recursive: true });
+    origCwd = process.cwd();
+    origPath = process.env.PATH;
+    origCmuxSurface = process.env.CMUX_SURFACE;
+    origCmuxLog = process.env.CMUX_LOG;
+    origApexTestRoot = process.env.APEX_TEST_ROOT;
+    process.chdir(tmpDir);
+
+    spawnSync("git", ["init"], { cwd: tmpDir });
+    spawnSync("git", ["-C", tmpDir, "config", "user.name", "test"]);
+    spawnSync("git", ["-C", tmpDir, "config", "user.email", "test@test.com"]);
+    spawnSync("git", ["commit", "--allow-empty", "-m", "init"], { cwd: tmpDir });
+
+    mkdirSync(join(tmpDir, ".apex-manager"), { recursive: true });
+    writeFileSync(join(tmpDir, ".apex-manager", "tasks.json"), JSON.stringify({
+      tasks: [{
+        id: "T1",
+        title: "Cross model launch",
+        description: "Verify cross-model workers really start.",
+        status: "assigned",
+        depends_on: [],
+        blocked_by: [],
+        evidence: [],
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      }],
+      next_id: 2,
+    }, null, 2));
+  });
+
+  afterEach(() => {
+    process.chdir(origCwd);
+    process.env.PATH = origPath;
+    if (origCmuxSurface === undefined) delete process.env.CMUX_SURFACE;
+    else process.env.CMUX_SURFACE = origCmuxSurface;
+    if (origCmuxLog === undefined) delete process.env.CMUX_LOG;
+    else process.env.CMUX_LOG = origCmuxLog;
+    if (origApexTestRoot === undefined) delete process.env.APEX_TEST_ROOT;
+    else process.env.APEX_TEST_ROOT = origApexTestRoot;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("kicks off interactive workers and verifies launch activity", async () => {
+    const binDir = join(tmpDir, "bin");
+    const logPath = join(tmpDir, "cmux.log");
+    mkdirSync(binDir, { recursive: true });
+
+    writeFileSync(join(binDir, "cmux"), `#!/bin/sh
+echo "$@" >> "$CMUX_LOG"
+case "$1" in
+  new-split)
+    echo "surface-1"
+    exit 0
+    ;;
+  send)
+    if printf '%s\n' "$@" | grep -q "Read the file .apex-manager/workers/T1-codex/worker-protocol.md"; then
+      mkdir -p "$APEX_TEST_ROOT/.apex-manager/workers/T1-codex"
+      printf '{\n  "stage": "executing",\n  "progress": "kickoff",\n  "last_activity": "2026-01-01T00:00:00Z"\n}\n' > "$APEX_TEST_ROOT/.apex-manager/workers/T1-codex/status.json"
+    fi
+    exit 0
+    ;;
+  send-key|rename-tab|validate-surface)
+    exit 0
+    ;;
+  read-screen)
+    echo '$ ready'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`);
+    chmodSync(join(binDir, "cmux"), 0o755);
+
+    process.env.PATH = `${binDir}:${origPath ?? ""}`;
+    process.env.CMUX_SURFACE = "surface-plan";
+    process.env.CMUX_LOG = logPath;
+    process.env.APEX_TEST_ROOT = tmpDir;
+
+    await spawnCrossModel("T1", ["codex"], []);
+
+    const meta = JSON.parse(readFileSync(join(tmpDir, ".apex-manager", "workers", "T1-codex", "meta.json"), "utf-8"));
+    assert.strictEqual(meta.launch_verification.state, "verified");
+    assert.strictEqual(meta.launch_verification.action_signal, "status_updated");
+
+    const protocolPath = join(tmpDir, ".apex-manager", "workers", "T1-codex", "worker-protocol.md");
+    assert.ok(readFileSync(protocolPath, "utf-8").includes("Cross model launch"));
+
+    const cmuxLog = readFileSync(logPath, "utf-8");
+    assert.ok(cmuxLog.includes("send surface-1 cd"));
+    assert.ok(cmuxLog.includes("send surface-1 Read the file .apex-manager/workers/T1-codex/worker-protocol.md"));
   });
 });

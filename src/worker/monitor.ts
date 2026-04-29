@@ -6,7 +6,7 @@ import { spawnSync } from "child_process";
 import { existsSync, readdirSync } from "fs";
 import { join } from "path";
 import { readJSON } from "../utils/json.js";
-import { detectAdapter } from "./terminal.js";
+import { adapterForHandle } from "./terminal.js";
 import type { WindowHandle } from "./terminal.js";
 
 // ── Interfaces ─────────────────────────────────────────────────────
@@ -32,17 +32,27 @@ export interface WorkerResult {
 export interface WorkerMeta {
   task_id: string;
   pid?: number;
-  window_handle: { id: string; name: string; adapter: string } | null;
+  window_handle: { id: string; name: string; adapter: string; session?: string } | null;
   worktree_path: string;
   branch: string;
   started_at: string;
   agent: string;
   /** "persistent" agents stay alive; "one-shot" agents exit after execution. */
   execution_mode?: "persistent" | "one-shot";
+  isolation_mode?: "git-worktree" | "project-root";
+  launch_verification?: {
+    state: "pending" | "verified" | "failed";
+    checked_at?: string;
+    action_signal?: "task_claimed" | "status_updated" | "result_written";
+    screen_summary?: string;
+    client_mapped?: boolean | null;
+    note?: string;
+  };
 }
 
 export interface WorkerHealth {
   alive: boolean;
+  starting: boolean;
   stale: boolean;
   completed: boolean;
   crashed: boolean;
@@ -60,6 +70,7 @@ export interface WorkerInfo {
 // ── Constants ──────────────────────────────────────────────────────
 
 const STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+const STARTUP_GRACE_MS = 15_000;
 const WORKERS_DIR = ".apex-manager/workers";
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -118,6 +129,9 @@ export async function checkWorkerHealth(taskId: string): Promise<WorkerHealth> {
   const result = await readJSON<WorkerResult | null>(join(dir, "result.json"), null);
 
   const completed = result !== null;
+  const startedAtMs = new Date(meta.started_at).getTime();
+  const withinStartupGrace = Number.isFinite(startedAtMs) && (Date.now() - startedAtMs) < STARTUP_GRACE_MS;
+  const starting = !completed && !status?.last_activity && withinStartupGrace;
 
   // Liveness: check terminal handle, then PID
   let terminalAlive = false;
@@ -125,12 +139,14 @@ export async function checkWorkerHealth(taskId: string): Promise<WorkerHealth> {
   let screenTail: string | undefined;
 
   if (meta.window_handle) {
+    const adapter = adapterForHandle(meta.window_handle as WindowHandle);
     try {
-      const adapter = detectAdapter();
+      screenTail = await adapter.readScreen(meta.window_handle as WindowHandle, 5);
+    } catch {
+      // Best-effort only; keep going so a dead surface still reports crash state.
+    }
+    try {
       terminalAlive = await adapter.isAlive(meta.window_handle as WindowHandle);
-      if (terminalAlive) {
-        screenTail = await adapter.readScreen(meta.window_handle as WindowHandle, 5);
-      }
     } catch {
       terminalAlive = false;
     }
@@ -152,12 +168,12 @@ export async function checkWorkerHealth(taskId: string): Promise<WorkerHealth> {
   // Crashed vs exited-without-result: both have no terminal and no result.
   // Distinguish by execution_mode: one-shot agents are expected to exit.
   const hadProcess = meta.pid !== undefined || meta.window_handle !== null;
-  const processGone = hadProcess && !alive && !completed;
+  const processGone = hadProcess && !alive && !completed && !starting;
   const isOneShot = meta.execution_mode === "one-shot";
   const crashed = processGone && !isOneShot;
   const exitedWithoutResult = processGone && isOneShot;
 
-  return { alive, stale, completed, crashed, exitedWithoutResult, screenTail };
+  return { alive, starting, stale, completed, crashed, exitedWithoutResult, screenTail };
 }
 
 // ── getMonitorReport ───────────────────────────────────────────────
@@ -174,6 +190,8 @@ export async function getMonitorReport(): Promise<string> {
 
     if (health.completed) {
       label = `completed (${w.result?.verdict ?? "unknown"})`;
+    } else if (health.starting) {
+      label = "STARTING";
     } else if (health.crashed) {
       label = "CRASHED";
     } else if (health.exitedWithoutResult) {

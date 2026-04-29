@@ -1,215 +1,312 @@
-<!-- Synced with README.md as of 2026-04-15 -->
-
 [English](README.md) | [中文](README.zh.md)
 
 # Apex Manager
 
-**多个 AI 编程 Agent 并行开发同一个代码仓库 —— 每个 Agent 独占一个 git worktree，确定性 daemon 负责集成，你只管决策。**
+`apex-manager` 是一个本地、终端优先的多 Agent 编排器。
 
-## 为什么做这个？
+它的目标不是替代 Claude/Codex/Gemini 这些 CLI，而是在同一个项目里，让一个 plan agent 会话稳定地带多个 worker 干活，提供：
+- 任务创建和依赖管理
+- 每个 worker 独立终端会话
+- git 仓库下的 worktree 隔离
+- manager 到 worker 的结构化消息
+- daemon 监控与恢复状态
+- artifact 记录和事件账本
 
-你开着 Claude Code，手头有四件事：写功能、写测试、更新文档、做安全审查。四个 Agent 并行，20 分钟搞定，比一个 Agent 干 2 小时强。
+这份 README 只描述当前代码里真实存在的能力，不引用 roadmap 未来态。
 
-于是你开了四个终端，建了四个分支，启动四个 Agent。20 分钟后回头一看：15 分钟花在了切终端、解冲突、重跑任务上。T2 在 T1 的分支还没准备好时就开始了，T3 跑的是过时代码，T4 不知道是完成了还是挂了。
+## 现在到底能做什么
 
-Agent 不是问题，它们会写代码。问题是协调 —— 而且协调的成本比干活本身涨得还快。大多数多 Agent 方案让 Agent 共享一个工作区，这个模型就是错的。并行 Agent 需要隔离，就像工地上不同楼层的工人：各有各的工具、各有各的材料、各干各的区域，一个工头统筹。
+当前版本已经有一套可用的本地控制面，核心都落在 `.apex-manager/` 下面。
 
-Apex Manager 给每个 Agent 一个独立的 git worktree。一个确定性的 daemon 在后台监控进度、跑测试、合并干净的代码。你留在决策位上 —— 而不是协调位上。
+现在可用的能力：
+- `init` 初始化本地状态目录和默认存储
+- `task` 管任务创建、依赖、claim、complete、block、update
+- `worker spawn` 启动 worker 终端、写 per-worker 协议文件，并在返回成功前验证它真的开始干活
+- `worker tell/ask/inject` 发送结构化 manager 消息
+- `msg` 直接查看和操作底层消息存储
+- `artifact` 记录任务输出
+- `orch` 启动 daemon、看状态、看事件、重建 snapshot
+- `--cross-model` 对同一任务拉多个 agent，再综合结果
 
-## 这是什么
+当前内置的默认 agent 包括：
+- `claude`
+- `ft-claude`
+- `codex`
+- `gemini`
+- `opencode`
 
-Apex Manager 是一个 CLI 工具，基于三层架构：
+如果你有自己的 CLI，也可以通过 `.apex-manager/agents.json` 扩展。
 
-- **Plan Agent**（你，当前的 AI 会话）—— 设计任务、做决策、处理故障
-- **Daemon**（后台 Node.js 进程）—— 监控 Worker、跑测试、合并通过的分支、启动下游任务
-- **Worker**（独立终端）—— 每个 Agent 在自己的 git worktree 和终端窗口中执行任务
+## 怎么理解它
 
-零运行时依赖。纯 TypeScript。开箱支持 Claude、ft-claude、Codex、Gemini、OpenCode —— 可扩展到任何命令行 Agent。Git 仓库自动使用 worktree 隔离；非 Git 项目也能用（Worker 共享项目根目录）。
+可以把它看成三层：
 
-## 核心特性
+1. Plan Agent
+就是你当前这个 AI 会话。它负责决定有哪些任务、什么时候调整、什么时候介入。
 
-- **Git worktree 隔离。** 每个 Worker 拿到一份真正独立的代码副本。没有文件冲突，没有半提交状态。Worker 完成后，它的分支在临时 worktree 里跑完测试再合并 —— 干净利落。
+2. Daemon
+本地 Node.js 后台循环。它负责监控 worker、处理 pending 消息、记录事件、维护编排生命周期。
 
-- **确定性 daemon。** 自动化层没有任何 AI。10 秒一次的 tick 循环：检查 Worker 健康状态、跑集成测试、fast-forward 合并通过的分支、启动解除阻塞的任务。可预测、可审计、不会幻觉出一个 merge。
+3. Workers
+真正执行任务的独立 CLI 会话，通常一个任务一个 worker，跑在 `tmux` 或 `cmux` 里。
 
-- **多 Agent 异构。** Claude 做架构、Codex 做实现、Gemini 做安全审查 —— 在同一个工作流里。Agent 适配器处理差异：二进制路径、中断键、协议注入方式、能力画像。
+这是一个本地优先系统，没有中心服务器。
 
-- **Skill/协议注入。** Worker 启动前，Apex Manager 从 Agent 的 skill 目录发现相关技能并注入为工作指令。Worker 拿到的不只是任务描述 —— 而是一套方法论。
+## 运行前提
 
-- **跨模型共识。** `--cross-model` 让同一个任务跑多个 Agent，结果自动综合去重。安全审查、架构评审 —— 多一个视角的成本远低于漏掉一个 bug。
+- macOS 或 Linux
+- Node.js 18+
+- 至少一个终端复用器：
+  - `tmux`
+  - 或 `cmux`
+- 如果你想要真正的隔离，项目本身最好是 git 仓库
 
-- **任务粒度的成本追踪。** 按 Worker 统计 Token 用量，按模型计价（Opus、Sonnet、Haiku）。预算预警和硬上限。每条并行工作流花了多少钱，一清二楚。
+注意：
+- 如果当前目录不是 git 仓库，worker 会退化到 shared project-root 模式。能跑，但多个 worker 共享同一目录，没有文件系统隔离。
+- 在 macOS 上，`tmux` 和 `cmux` 都能用；很多情况下，先把 `tmux` 路径跑稳是更简单的基线。
 
-## 对比
+## 安装
 
-| | 手动多 Agent | 用 Apex Manager |
-|---|---|---|
-| **工作区** | Agent 共享一个目录 —— 文件冲突 | 每个 Agent 独占一个 git worktree |
-| **协调** | 你在终端和分支间来回切换 | Daemon 自动监控、自动测试、自动合并 |
-| **集成** | 合并后祈祷测试还能过 | 先在临时 worktree 跑测试，*通过了*再合到 main |
-| **故障** | 过一会儿才发现出了问题 | Daemon 抓取终端状态，立刻通知你 |
-| **并行度** | 理论上并行 —— 协调开销吃掉收益 | 真正并行 —— Agent 之间完全独立 |
-| **Agent 多样性** | 单一 Agent，或者手动切换 | Claude + Codex + Gemini 各干各的，同一个工作流 |
-
-## 工作原理
-
-### 架构
-
-```
-┌─────────────────────────────────────────────────┐
-│               Plan Agent（你）                    │
-│       任务设计 · 决策 · 故障处理                    │
-└────────────────────┬────────────────────────────┘
-                     │ apex-manager CLI
-                     ▼
-┌─────────────────────────────────────────────────┐
-│              Daemon（后台进程）                     │
-│  10s tick: 监控 → 测试 → 合并 → 启动 → 通知        │
-└──┬──────────────┬──────────────┬────────────────┘
-   │              │              │
-   ▼              ▼              ▼
-┌────────┐   ┌────────┐   ┌────────┐
-│  T1    │   │  T2    │   │  T3    │
-│ Claude │   │ Codex  │   │ Gemini │
-│worktree│   │worktree│   │worktree│
-└────────┘   └────────┘   └────────┘
-```
-
-**Plan Agent**（你的当前会话）负责判断：做什么、怎么应对故障、什么时候调整方向。**Daemon** 负责自动化：纯代码，没有 AI，确定性可审计。**Worker** 负责执行：各自在隔离的终端和 worktree 里干活。
-
-三层各司其职。Worker 不能编排。Daemon 不做判断。你不手动合分支。
-
-### 工作流
-
-**阶段一 —— 启动 Worker 和 Daemon：**
+如果你只是想在这个仓库里直接运行 CLI：
 
 ```bash
-apex-manager worker spawn T1 --agent claude --protocol apex-forge
-apex-manager worker spawn T2 --agent codex
-apex-manager orch start
+npm install
+npx tsx src/cli.ts --help
 ```
 
-**阶段二 —— 监控、调整、必要时介入：**
+如果你想得到全局命令：
 
 ```bash
-apex-manager orch status
-apex-manager worker directive T1 amend "补充边界情况 X 的处理" --urgent
-apex-manager worker status T1      # 读终端输出
-apex-manager worker interrupt T1   # 中断 Agent
+npm install
+npm link
+apex-manager --help
 ```
 
-**阶段三 —— Daemon 自动合并通过的工作。收尾：**
+如果你还想把本地 skill 入口也装进去：
 
 ```bash
-apex-manager worker merge-all --strategy local
-apex-manager orch stop
+./install.sh
 ```
 
-### 设计决策
-
-| 选择 | 为什么 |
-|------|--------|
-| Git worktree 而非分支 | 真正的文件系统隔离 —— Agent 之间无法干扰对方未提交的修改 |
-| 确定性 daemon（无 AI） | 合并决策应该来自测试结果，不是 LLM 的判断 |
-| 文件 IPC 而非网络 | 可观测（读 JSON 就能调试）、容错、没有服务器会崩 |
-| 终端复用器（tmux/cmux） | 直接读屏幕做诊断，sendKey 做中断 —— 真正的 Agent 控制 |
-| 零运行时依赖 | 一条 `tsx` 命令就跑起来。不装东西，不坏东西 |
-
-### 文件 IPC 协议
-
-所有状态通过 `.apex-manager/` 流转：
-
-```
-.apex-manager/
-├── config.yaml              # 配置
-├── tasks.json               # 任务 DAG
-├── workers/
-│   └── T1/
-│       ├── meta.json        # worktree 路径、分支、Agent 类型
-│       ├── status.json      # Worker 的进度更新
-│       ├── result.json      # 最终结论：pass / fail / blocked
-│       ├── escalation.json  # Worker → Plan Agent 的提问
-│       └── directive.json   # Plan Agent → Worker 的指令
-├── notifications/           # Daemon → Plan Agent 通知队列
-├── orch.lock                # 单 daemon 保证
-└── event-log.jsonl          # 审计日志
-```
+安装脚本会把当前仓库做成软链接，放到：
+- `~/.agents/skills/apex-manager`
+- `~/.claude/skills/apex-manager`
+- `~/.codex/skills/apex-manager`
+- `~/.gemini/skills/apex-manager`
 
 ## 快速开始
 
-**前置条件：** Node.js >= 18、git、tmux（Linux）或 cmux（macOS）
+先初始化本地状态：
 
 ```bash
-# 1. 克隆
-git clone <repo-url>
-cd apex-manager && npm install
-
-# 2. 启动一个 Worker
-npx tsx src/cli.ts worker spawn T1 --agent claude
-
-# 3. 启动 Daemon
-npx tsx src/cli.ts orch start
-
-# 4. 查看状态
-npx tsx src/cli.ts orch status
+apex-manager init
 ```
 
-### CLI 速查
+先看哪些 agent CLI 当前可用：
 
 ```bash
-# Worker 命令
-apex-manager worker spawn <id> [--agent claude|codex|gemini|opencode] [--protocol <skill>] [--cross-model]
-apex-manager worker kill <id>
-apex-manager worker list
-apex-manager worker status <id>
-apex-manager worker interrupt <id>
-apex-manager worker directive <id> <amend|pause|abort|info> <content> [--urgent]
-apex-manager worker merge <id> [--strategy local|pr|squash]
-apex-manager worker merge-all
-apex-manager worker check           # 检查可用 Agent
-apex-manager worker report          # 成本报告
+apex-manager worker check
+```
 
-# Daemon 命令
+创建几个任务：
+
+```bash
+apex-manager task create "Build API" "Implement the endpoint and tests"
+apex-manager task create "Review API" "Review the implementation" --depends T1 --agent codex
+apex-manager task list
+```
+
+启动一个 worker：
+
+```bash
+apex-manager worker spawn T1 --agent claude
+```
+
+`spawn` 现在会做这些事：
+- 准备 worker 目录
+- 如果当前项目是 git 仓库，就创建独立 worktree
+- 写 `.apex-manager/workers/T1/worker-protocol.md`
+- 打开 worker 终端
+- 注入 kickoff 指令
+- 在返回成功前验证真实动作，比如 `task claim`、`status.json`、`result.json`
+
+启动 daemon：
+
+```bash
+apex-manager orch start
+```
+
+查看实时状态：
+
+```bash
+apex-manager worker list
+apex-manager worker status T1
+apex-manager orch status
+apex-manager orch events --tail 20
+```
+
+给 worker 发 manager 消息：
+
+```bash
+apex-manager worker tell T1 "Please tighten the edge-case handling."
+apex-manager worker ask T1 "Did you cover the empty input path?" --wait-ack
+apex-manager worker inject T1 "Stop the current approach and switch to the new response shape." --urgent
+```
+
+记录产物：
+
+```bash
+apex-manager artifact submit T1 --by T1 --type report --path ./notes.md --summary "Implementation notes"
+apex-manager artifact list T1
+```
+
+收尾：
+
+```bash
+apex-manager worker merge T1
+apex-manager orch stop
+```
+
+## 命令面
+
+顶层命令：
+
+```bash
+apex-manager init
+apex-manager task ...
+apex-manager worker ...
+apex-manager artifact ...
+apex-manager msg ...
+apex-manager orch ...
+```
+
+常用 task 命令：
+
+```bash
+apex-manager task create <title> [description...] [--depends <task-id>] [--agent <agent>] [--protocol <skill>] [--category <cat>]
+apex-manager task list
+apex-manager task status <task-id>
+apex-manager task claim <task-id> [--by <worker-id>]
+apex-manager task complete <task-id> [--by <worker-id>] [--summary <summary>] [--evidence <artifact-id>]
+apex-manager task block <task-id> --reason <reason> [--by <worker-id>]
+apex-manager task update <task-id> [--status <status>] [--agent <agent>] [--protocol <skill>]
+```
+
+常用 worker 命令：
+
+```bash
+apex-manager worker spawn <task-id> [--agent <agent>] [--protocol <skill>] [--cross-model] [--dry-run]
+apex-manager worker list
+apex-manager worker status <task-id>
+apex-manager worker interrupt <task-id>
+apex-manager worker tell <task-id> <message> [--wait-ack]
+apex-manager worker ask <task-id> <question> [--wait-ack]
+apex-manager worker inject <task-id> <message> [--urgent]
+apex-manager worker merge <task-id> [--strategy local|pr|squash]
+apex-manager worker merge-all [--strategy local|pr|squash]
+apex-manager worker report
+apex-manager worker synthesize <task-id>
+```
+
+常用 daemon 命令：
+
+```bash
 apex-manager orch start [--force]
 apex-manager orch stop
 apex-manager orch status
+apex-manager orch events [--tail <n>] [--type <event-type>]
+apex-manager orch snapshot [--rebuild]
 ```
 
-## 项目结构
+常用底层消息命令：
 
-```
-apex-manager/
-├── src/
-│   ├── cli.ts                    # 入口 —— 命令路由
-│   ├── commands/
-│   │   ├── worker.ts             # spawn / kill / merge / interrupt / directive
-│   │   └── orch.ts               # Daemon 生命周期 + 锁管理
-│   ├── daemon/
-│   │   ├── daemon.ts             # Tick 循环：监控 → 测试 → 合并 → 启动
-│   │   ├── integrate.ts          # worktree 内测试 + fast-forward 合并
-│   │   └── notify.ts             # Plan Agent 通知投递
-│   ├── worker/
-│   │   ├── protocol-builder.ts   # 为每个 Worker 组装工作指令
-│   │   ├── agent-adapter.ts      # Agent 特定的 CLI 知识
-│   │   ├── terminal.ts           # tmux / cmux 抽象层
-│   │   ├── monitor.ts            # 健康检查 + 状态读取
-│   │   ├── cross-model.ts        # 多 Agent 结果综合
-│   │   ├── cost.ts               # 预算追踪 + 告警
-│   │   └── proxy.ts              # 速率限制提取
-│   ├── types/
-│   │   ├── config.ts             # 配置 schema + 默认值
-│   │   └── task.ts               # 任务模型 + 状态机
-│   └── utils/
-│       ├── config.ts             # YAML 配置加载
-│       ├── json.ts               # 原子 JSON 读写
-│       └── logger.ts             # 事件日志
-├── roles/
-│   └── manager.md                # Plan Agent 角色定义
-├── SKILL.md                      # Skill 激活指南
-├── package.json
-└── tsconfig.json
+```bash
+apex-manager msg send <to> <body> [--from <sender>] [--kind <directive|question|info>] [--priority <normal|urgent>] [--wait-ack]
+apex-manager msg list [--to <task-id>] [--status <pending|delivered|acked|ack_timeout|failed>]
+apex-manager msg show <message-id>
+apex-manager msg ack <message-id> [--by <worker-id>]
 ```
 
-## License
+## 本地状态目录
 
-MIT
+所有本地状态都在 `.apex-manager/`：
+
+```text
+.apex-manager/
+├── config.yaml
+├── agents.json
+├── tasks.json
+├── events.jsonl
+├── event-log.jsonl
+├── state.snapshot.json
+├── orch.lock
+├── orch.pid
+├── workers/
+├── worktrees/
+├── artifacts/
+│   └── index.json
+├── messages/
+│   └── index.json
+└── notifications/
+```
+
+一个 worker 目录大概长这样：
+
+```text
+.apex-manager/workers/T1/
+├── meta.json
+├── worker-protocol.md
+├── status.json
+├── result.json
+├── escalation.json
+└── directive.json
+```
+
+## 现在这些行为很重要
+
+下面这些不是文案细节，而是当前真实行为：
+
+- 协议文件现在是 per-worker 的，不再共用一个 `worker-protocol.md`
+- `spawn` 不会因为“屏幕上出现了 prompt”就算成功
+- 普通消息在 worker 忙时可能保持 `pending`
+- 紧急消息会先中断，再尝试注入
+- 消息编号和消息存储写入已经做了并发保护
+- 在普通终端里走 `tmux` 时，每个 worker 会拿独立 detached session，不再让多个 GUI terminal 共用同一个可见窗口
+- `cross-model` 路径和普通 `spawn` 现在共用同一套 kickoff 和 launch verification 逻辑
+
+## 已知边界
+
+- idle 检测本质上还是启发式。如果上游 agent CLI 大改界面，ready/busy 规则可能需要再调。
+- 非 git 项目没有真正的隔离。Apex Manager 会明确警告，但没法从文件系统层面阻止并发冲突。
+- 宿主运行环境的 sandbox 仍然可能阻止 `tmux` socket 或终端控制。这类问题很多时候是环境限制，不一定是 Apex Manager 逻辑 bug。
+- merge 自动化偏本地 CLI 工作流；如果你的流程是 GitHub PR 优先，请结合 `--strategy pr` 和你自己的环境一起验证。
+
+## 开发
+
+安装依赖：
+
+```bash
+npm install
+```
+
+直接从源码跑 CLI：
+
+```bash
+npx tsx src/cli.ts --help
+```
+
+验证仓库：
+
+```bash
+npm run typecheck
+npm test
+```
+
+## 它不是什么
+
+Apex Manager 不是：
+- 托管式多 Agent 平台
+- 通用 Web 控制台
+- 某个 agent CLI 的替代品
+
+它是一个围绕现有 agent CLI 的本地编排层。
