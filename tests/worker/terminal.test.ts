@@ -1,5 +1,8 @@
-import { describe, it, afterEach } from "node:test";
+import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import type { WindowHandle, TerminalAdapter } from "../../src/worker/terminal.js";
 import { CmuxAdapter, TmuxAdapter, detectAdapter } from "../../src/worker/terminal.js";
 
@@ -52,6 +55,78 @@ describe("CmuxAdapter", () => {
     assert.strictEqual(typeof adapter.isAlive, "function");
     assert.strictEqual(typeof adapter.rename, "function");
     assert.strictEqual(typeof adapter.sendKey, "function");
+  });
+});
+
+describe("CmuxAdapter command submission", () => {
+  let tmpPathDir: string;
+  let logPath: string;
+  const origEnv = { ...process.env };
+
+  beforeEach(() => {
+    tmpPathDir = join(tmpdir(), `am-cmux-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    mkdirSync(tmpPathDir, { recursive: true });
+    logPath = join(tmpPathDir, "cmux.log");
+
+    const script = `#!/bin/sh
+echo "$@" >> "$CMUX_LOG"
+case "$1" in
+  new-split)
+    echo "surface-123"
+    exit 0
+    ;;
+  new-surface)
+    echo "surface-fallback"
+    exit 0
+    ;;
+  send|send-key|rename-tab|close-surface|validate-surface|read-screen|ping|--version)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`;
+    const scriptPath = join(tmpPathDir, "cmux");
+    writeFileSync(scriptPath, script);
+    chmodSync(scriptPath, 0o755);
+
+    process.env = {
+      ...origEnv,
+      PATH: `${tmpPathDir}:${origEnv.PATH ?? ""}`,
+      CMUX_LOG: logPath,
+    };
+  });
+
+  afterEach(() => {
+    process.env = { ...origEnv };
+    rmSync(tmpPathDir, { recursive: true, force: true });
+  });
+
+  it("send() appends enter after cmux send", async () => {
+    const adapter = new CmuxAdapter();
+    await adapter.send({ id: "surface-1", name: "T1-auth", adapter: "cmux" }, "echo ready");
+
+    const lines = readFileSync(logPath, "utf-8").trim().split("\n");
+    assert.deepStrictEqual(lines, [
+      "send surface-1 echo ready",
+      "send-key surface-1 enter",
+    ]);
+  });
+
+  it("createWindow() submits the initial command in a new split", async () => {
+    const adapter = new CmuxAdapter();
+    const handle = await adapter.createWindow("T1-auth", "echo boot");
+
+    assert.strictEqual(handle.id, "surface-123");
+
+    const lines = readFileSync(logPath, "utf-8").trim().split("\n");
+    assert.deepStrictEqual(lines, [
+      "new-split right",
+      "send surface-123 echo boot",
+      "send-key surface-123 enter",
+      "rename-tab surface-123 T1-auth",
+    ]);
   });
 });
 

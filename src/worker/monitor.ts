@@ -6,7 +6,7 @@ import { spawnSync } from "child_process";
 import { existsSync, readdirSync } from "fs";
 import { join } from "path";
 import { readJSON } from "../utils/json.js";
-import { detectAdapter } from "./terminal.js";
+import { adapterForHandle } from "./terminal.js";
 import type { WindowHandle } from "./terminal.js";
 
 // ── Interfaces ─────────────────────────────────────────────────────
@@ -43,6 +43,7 @@ export interface WorkerMeta {
 
 export interface WorkerHealth {
   alive: boolean;
+  starting: boolean;
   stale: boolean;
   completed: boolean;
   crashed: boolean;
@@ -60,6 +61,7 @@ export interface WorkerInfo {
 // ── Constants ──────────────────────────────────────────────────────
 
 const STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+const STARTUP_GRACE_MS = 15_000;
 const WORKERS_DIR = ".apex-manager/workers";
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -118,6 +120,9 @@ export async function checkWorkerHealth(taskId: string): Promise<WorkerHealth> {
   const result = await readJSON<WorkerResult | null>(join(dir, "result.json"), null);
 
   const completed = result !== null;
+  const startedAtMs = new Date(meta.started_at).getTime();
+  const withinStartupGrace = Number.isFinite(startedAtMs) && (Date.now() - startedAtMs) < STARTUP_GRACE_MS;
+  const starting = !completed && !status?.last_activity && withinStartupGrace;
 
   // Liveness: check terminal handle, then PID
   let terminalAlive = false;
@@ -125,12 +130,14 @@ export async function checkWorkerHealth(taskId: string): Promise<WorkerHealth> {
   let screenTail: string | undefined;
 
   if (meta.window_handle) {
+    const adapter = adapterForHandle(meta.window_handle as WindowHandle);
     try {
-      const adapter = detectAdapter();
+      screenTail = await adapter.readScreen(meta.window_handle as WindowHandle, 5);
+    } catch {
+      // Best-effort only; keep going so a dead surface still reports crash state.
+    }
+    try {
       terminalAlive = await adapter.isAlive(meta.window_handle as WindowHandle);
-      if (terminalAlive) {
-        screenTail = await adapter.readScreen(meta.window_handle as WindowHandle, 5);
-      }
     } catch {
       terminalAlive = false;
     }
@@ -152,12 +159,12 @@ export async function checkWorkerHealth(taskId: string): Promise<WorkerHealth> {
   // Crashed vs exited-without-result: both have no terminal and no result.
   // Distinguish by execution_mode: one-shot agents are expected to exit.
   const hadProcess = meta.pid !== undefined || meta.window_handle !== null;
-  const processGone = hadProcess && !alive && !completed;
+  const processGone = hadProcess && !alive && !completed && !starting;
   const isOneShot = meta.execution_mode === "one-shot";
   const crashed = processGone && !isOneShot;
   const exitedWithoutResult = processGone && isOneShot;
 
-  return { alive, stale, completed, crashed, exitedWithoutResult, screenTail };
+  return { alive, starting, stale, completed, crashed, exitedWithoutResult, screenTail };
 }
 
 // ── getMonitorReport ───────────────────────────────────────────────
@@ -174,6 +181,8 @@ export async function getMonitorReport(): Promise<string> {
 
     if (health.completed) {
       label = `completed (${w.result?.verdict ?? "unknown"})`;
+    } else if (health.starting) {
+      label = "STARTING";
     } else if (health.crashed) {
       label = "CRASHED";
     } else if (health.exitedWithoutResult) {

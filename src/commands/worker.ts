@@ -3,10 +3,12 @@ import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync
 import { join, resolve } from "path";
 import { readJSON, writeJSON } from "../utils/json.js";
 import { buildWorkerProtocol, agentStartCommand } from "../worker/protocol-builder.js";
-import { detectAdapter } from "../worker/terminal.js";
+import { adapterForHandle, detectAdapter } from "../worker/terminal.js";
 import type { Task, TaskStore } from "../types/task.js";
 import type { ProtocolBuildOptions } from "../worker/protocol-builder.js";
 import type { WorkerMeta, WorkerResult } from "../worker/monitor.js";
+import type { AgentAdapter } from "../worker/agent-adapter.js";
+import type { TerminalAdapter, WindowHandle } from "../worker/terminal.js";
 import { spawnCrossModel, parseCrossModelArgs, synthesizeResults } from "../worker/cross-model.js";
 import { listWorkers, checkWorkerHealth, getMonitorReport } from "../worker/monitor.js";
 import { formatCostReport, formatRateLimitStatus } from "../worker/cost.js";
@@ -17,7 +19,7 @@ import { checkAgent, checkAllAgents } from "../worker/capability-check.js";
 import { loadAgentsConfig, resolveAdapterWithConfig } from "../worker/agent-adapter.js";
 import { interruptKeys } from "../worker/interrupt.js";
 import { sendStructuredMessage } from "../worker/messages.js";
-import { isWorkerIdleScreen } from "../worker/idle.js";
+import { isWorkerIdleScreen, waitForWorkerIdle } from "../worker/idle.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -69,6 +71,54 @@ function flagValue(args: string[], flag: string): string | undefined {
 
 function findTask(tasks: Task[], taskId: string): Task | undefined {
   return tasks.find((t) => t.id === taskId);
+}
+
+export function buildWorkerKickoffMessage(agentAdapter: AgentAdapter, relProtocolPath: string): string | null {
+  if (agentAdapter.needsPostCreateSend) {
+    return `Read the file ${relProtocolPath} and execute all tasks described in it. This is your complete work instruction.`;
+  }
+
+  if (agentAdapter.protocolInjection.type === "system-prompt-file") {
+    return `Start now. Your worker protocol from ${relProtocolPath} is already loaded in system context. Execute it immediately and continue autonomously until done or blocked.`;
+  }
+
+  return null;
+}
+
+function summarizeSmokeScreen(screen: string): string {
+  const line = screen
+    .split("\n")
+    .map((entry) => entry.trim())
+    .reverse()
+    .find((entry) => entry.length > 0);
+  return line ?? "(screen empty)";
+}
+
+async function runStartupSmokeTest(taskId: string, terminal: TerminalAdapter, handle: WindowHandle): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 1_500));
+
+  try {
+    const screen = await terminal.readScreen(handle, 8);
+    console.log(`[smoke] ${taskId}: ${summarizeSmokeScreen(screen).slice(0, 140)}`);
+  } catch (error) {
+    console.warn(`[smoke] ${taskId}: unable to read terminal yet (${String(error)})`);
+  }
+}
+
+async function waitForKickoffReady(
+  taskId: string,
+  agent: string,
+  terminal: TerminalAdapter,
+  handle: WindowHandle,
+): Promise<void> {
+  try {
+    const ready = await waitForWorkerIdle(terminal, handle, agent, 30_000, 500);
+    if (!ready) {
+      console.warn(`[warn] ${taskId}: worker did not show an idle prompt within 30s; sending kickoff anyway`);
+    }
+  } catch (error) {
+    console.warn(`[warn] ${taskId}: unable to confirm worker readiness (${String(error)}); sending kickoff anyway`);
+  }
 }
 
 // WorkerMeta imported from ../worker/monitor.js
@@ -218,15 +268,7 @@ async function cmdSpawn(args: string[]): Promise<void> {
   const terminal = detectAdapter();
   const handle = await terminal.createWindow(windowName, command);
 
-  // 9. Post-create protocol injection for agents that need it
-  if (agentAdapter.needsPostCreateSend) {
-    // Wait for agent CLI to start, then send the protocol read instruction
-    await new Promise((r) => setTimeout(r, 3000));
-    const relProtocol = ".apex-manager/worker-protocol.md";
-    await terminal.send(handle, `Read the file ${relProtocol} and execute all tasks described in it. This is your complete work instruction.`);
-  }
-
-  // 10. Update meta with window handle
+  // 9. Update meta with window handle immediately so monitoring can diagnose startup failures
   meta.window_handle = handle;
   await writeJSON(join(workersDir, "meta.json"), meta);
   await recordKernelEvent({
@@ -235,7 +277,18 @@ async function cmdSpawn(args: string[]): Promise<void> {
     worker: { ...meta },
   });
 
-  // 11. Print confirmation
+  // 10. Kick off the worker once the interactive CLI is ready.
+  const relProtocol = ".apex-manager/worker-protocol.md";
+  const kickoffMessage = buildWorkerKickoffMessage(agentAdapter, relProtocol);
+  if (kickoffMessage) {
+    await waitForKickoffReady(taskId, agent, terminal, handle);
+    await terminal.send(handle, kickoffMessage);
+  }
+
+  // 11. Smoke test the terminal shortly after spawn so false-positive launches are obvious.
+  await runStartupSmokeTest(taskId, terminal, handle);
+
+  // 12. Print confirmation
   console.log(`Worker ${taskId} spawned in window ${windowName} (agent: ${agent}, worktree: ${worktreeRel})`);
 }
 
@@ -269,7 +322,7 @@ async function cmdKill(args: string[]): Promise<void> {
   // 2. Close terminal window if handle exists
   if (meta.window_handle) {
     try {
-      const adapter = detectAdapter();
+      const adapter = adapterForHandle(meta.window_handle);
       await adapter.close(meta.window_handle);
     } catch {
       // Window may already be closed -- proceed with cleanup
@@ -327,7 +380,7 @@ async function cmdInterrupt(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const terminal = detectAdapter();
+  const terminal = adapterForHandle(meta.window_handle);
   const adapterName = terminal.name() as "cmux" | "tmux";
   // Read interrupt type from agent config; fall back to "esc" for unknown agents
   const agentsCfg = loadAgentsConfig();
@@ -736,6 +789,7 @@ export async function cmdWorker(args: string[]): Promise<void> {
         const health = await checkWorkerHealth(w.meta.task_id);
         let status: string;
         if (health.completed) status = "completed";
+        else if (health.starting) status = "STARTING";
         else if (health.crashed) status = "CRASHED";
         else if (health.exitedWithoutResult) status = "EXITED (no result)";
         else if (health.stale) status = "STALE";
@@ -772,6 +826,7 @@ export async function cmdWorker(args: string[]): Promise<void> {
       }
       let statusLabel: string;
       if (health.completed) statusLabel = "completed";
+      else if (health.starting) statusLabel = "STARTING";
       else if (health.crashed) statusLabel = "CRASHED";
       else if (health.exitedWithoutResult) statusLabel = "EXITED (no result)";
       else if (health.stale) statusLabel = "STALE";

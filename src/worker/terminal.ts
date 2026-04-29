@@ -71,6 +71,13 @@ export class CmuxAdapter implements TerminalAdapter {
     return which("cmux") ? "cmux" : CMUX_BIN;
   }
 
+  private submit(surfaceId: string): void {
+    const result = run(this.bin(), ["send-key", surfaceId, "enter"]);
+    if (!result.ok) {
+      throw new Error(`cmux send-key failed: ${result.stderr}`);
+    }
+  }
+
   async createWindow(name: string, command: string): Promise<WindowHandle> {
     const bin = this.bin();
 
@@ -87,6 +94,7 @@ export class CmuxAdapter implements TerminalAdapter {
       if (!sendResult.ok) {
         throw new Error(`cmux send failed: ${sendResult.stderr}`);
       }
+      this.submit(surfaceId);
       run(bin, ["rename-tab", surfaceId, name]);
       return { id: surfaceId, name, adapter: "cmux" };
     }
@@ -98,6 +106,7 @@ export class CmuxAdapter implements TerminalAdapter {
     if (!sendResult.ok) {
       throw new Error(`cmux send failed: ${sendResult.stderr}`);
     }
+    this.submit(surfaceId);
 
     // Rename the tab for identification
     run(bin, ["rename-tab", surfaceId, name]);
@@ -110,6 +119,7 @@ export class CmuxAdapter implements TerminalAdapter {
     if (!result.ok) {
       throw new Error(`cmux send failed: ${result.stderr}`);
     }
+    this.submit(handle.id);
   }
 
   async readScreen(handle: WindowHandle, lines?: number): Promise<string> {
@@ -325,6 +335,16 @@ export class TmuxAdapter implements TerminalAdapter {
 }
 
 // --- Auto-detection ---
+
+export function adapterForHandle(handle: WindowHandle | null | undefined): TerminalAdapter {
+  if (handle?.adapter === "cmux") {
+    return new CmuxAdapter();
+  }
+  if (handle?.adapter === "tmux") {
+    return new TmuxAdapter();
+  }
+  return detectAdapter();
+}
 
 export function detectAdapter(): TerminalAdapter {
   // Priority 1: cmux env vars — any of these means we're inside a cmux session.

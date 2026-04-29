@@ -128,6 +128,33 @@ describe("cmdWorker", () => {
     });
   });
 
+  describe("buildWorkerKickoffMessage", () => {
+    it("asks post-create-send agents to read the protocol file", async () => {
+      const { buildWorkerKickoffMessage } = await import("../../src/commands/worker.js");
+      const { BUILTIN_ADAPTERS } = await import("../../src/worker/agent-adapter.js");
+
+      const message = buildWorkerKickoffMessage(
+        BUILTIN_ADAPTERS.codex,
+        ".apex-manager/worker-protocol.md",
+      );
+
+      assert.ok(message?.includes("Read the file .apex-manager/worker-protocol.md"));
+    });
+
+    it("kicks off system-prompt-file agents so they start immediately", async () => {
+      const { buildWorkerKickoffMessage } = await import("../../src/commands/worker.js");
+      const { BUILTIN_ADAPTERS } = await import("../../src/worker/agent-adapter.js");
+
+      const message = buildWorkerKickoffMessage(
+        BUILTIN_ADAPTERS.claude,
+        ".apex-manager/worker-protocol.md",
+      );
+
+      assert.ok(message?.includes("already loaded"));
+      assert.ok(message?.includes("Execute it immediately"));
+    });
+  });
+
   // --- spawn --dry-run ---
 
   describe("spawn --dry-run", () => {

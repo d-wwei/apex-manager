@@ -82,11 +82,8 @@ describe("daemon message queue loop", () => {
       }],
     }, null, 2));
 
-    const { createDaemonState, processMessageQueue } = await import("../../src/daemon/daemon.js");
-    const state = createDaemonState(tmpDir, null);
-    state.adapter = makeIdleAdapter(sent);
-
-    await processMessageQueue(state);
+    const { processMessageQueueOnce } = await import("../../src/worker/messages.js");
+    await processMessageQueueOnce({ adapter: makeIdleAdapter(sent) });
 
     const store = JSON.parse(readFileSync(join(tmpDir, ".apex-manager", "messages", "index.json"), "utf-8"));
     assert.strictEqual(store.messages[0].delivery_status, "delivered");
@@ -112,11 +109,8 @@ describe("daemon message queue loop", () => {
       }],
     }, null, 2));
 
-    const { createDaemonState, processMessageQueue } = await import("../../src/daemon/daemon.js");
-    const state = createDaemonState(tmpDir, null);
-    state.adapter = makeAckAdapter();
-
-    await processMessageQueue(state);
+    const { processMessageQueueOnce } = await import("../../src/worker/messages.js");
+    await processMessageQueueOnce({ adapter: makeAckAdapter() });
 
     const store = JSON.parse(readFileSync(join(tmpDir, ".apex-manager", "messages", "index.json"), "utf-8"));
     assert.strictEqual(store.messages[0].delivery_status, "acked");
@@ -142,11 +136,8 @@ describe("daemon message queue loop", () => {
       }],
     }, null, 2));
 
-    const { createDaemonState, processMessageQueue } = await import("../../src/daemon/daemon.js");
-    const state = createDaemonState(tmpDir, null);
-    state.adapter = makeIdleAdapter([]);
-
-    await processMessageQueue(state);
+    const { processMessageQueueOnce } = await import("../../src/worker/messages.js");
+    await processMessageQueueOnce({ adapter: makeIdleAdapter([]) });
 
     const store = JSON.parse(readFileSync(join(tmpDir, ".apex-manager", "messages", "index.json"), "utf-8"));
     assert.strictEqual(store.messages[0].delivery_status, "ack_timeout");

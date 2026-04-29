@@ -5,7 +5,7 @@ import { recordKernelEvent } from "../utils/events.js";
 import type { MessageRecord, MessageStore } from "../types/message.js";
 import type { WorkerMeta } from "./monitor.js";
 import type { TerminalAdapter, WindowHandle } from "./terminal.js";
-import { detectAdapter } from "./terminal.js";
+import { adapterForHandle, detectAdapter } from "./terminal.js";
 import { loadAgentsConfig } from "./agent-adapter.js";
 import { interruptKeys } from "./interrupt.js";
 import { isWorkerIdleScreen, waitForWorkerIdle } from "./idle.js";
@@ -319,7 +319,7 @@ export async function processMessageQueueOnce(
     idlePollIntervalMs?: number;
   } = {},
 ): Promise<ProcessMessageQueueResult> {
-  const adapter = options.adapter ?? detectAdapter();
+  const fallbackAdapter = options.adapter;
   const store = await loadMessageStore();
   const before = new Map(store.messages.map((message) => [message.id, message.delivery_status]));
 
@@ -330,6 +330,10 @@ export async function processMessageQueueOnce(
         continue;
       }
       try {
+        const adapter = fallbackAdapter
+          ?? (meta.window_handle
+            ? adapterForHandle(meta.window_handle as WindowHandle)
+            : detectAdapter());
         await attemptDelivery(store, message, meta, adapter, {
           idleWaitTimeoutMs: options.idleWaitTimeoutMs,
           idlePollIntervalMs: options.idlePollIntervalMs,
@@ -339,6 +343,11 @@ export async function processMessageQueueOnce(
       }
     } else if (message.delivery_status === "delivered" && message.ack_required) {
       try {
+        const meta = loadWorkerMeta(message.to);
+        if (!meta?.window_handle) {
+          continue;
+        }
+        const adapter = fallbackAdapter ?? adapterForHandle(meta.window_handle as WindowHandle);
         await reconcileDeliveredMessageAck(store, message, adapter, options.now ?? new Date());
       } catch {
         // Ignore read failures; daemon will retry on the next tick.
@@ -408,7 +417,7 @@ export async function sendStructuredMessage(
     writeDirective(options.to, message.directive_action, message.body, message.priority);
   }
 
-  const adapter = options.adapter ?? detectAdapter();
+  const adapter = options.adapter ?? adapterForHandle(meta.window_handle as WindowHandle);
 
   try {
     await attemptDelivery(store, message, meta, adapter, {

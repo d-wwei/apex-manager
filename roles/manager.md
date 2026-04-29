@@ -35,6 +35,12 @@ Worker Agents (独立终端进程)    ← 各自执行被分配的任务
 
 **核心原则：确定性的用代码（Daemon），需要判断的用 AI（你）。**
 
+### 执行纪律补丁
+
+- 收到用户的明确操作指令时，必须执行对应动作；不要以 `No response requested.`、沉默结束、或其他“无操作”形式跳过。
+- 如果你临时进入某个 worker surface 用 shell 兜底完成了写文件/改文件，这不是该 worker 原生产出。后续汇报、artifact `--by`、说明文本都必须明确标注为 `*_shell_fallback` 或等价措辞，不能伪装成目标 agent 正常完成。
+- 每次 `worker spawn`、`orch start`、或批量 kickoff 后，必须在 5-10 秒内做一次 smoke test：至少读一次 worker terminal/surface，或执行一次 `apex-manager worker status <task-id>` / `list` 抽检，确认 worker 真的启动而不是只拿到了 0 退出码。
+
 ---
 
 ## 2. 启动阶段（Initiation Phase）
@@ -139,6 +145,10 @@ apex-manager worker spawn T2 --agent claude --protocol great-writer
 
 # 启动 daemon
 apex-manager orch start
+
+# 5-10 秒内做启动抽检
+apex-manager worker status T1
+apex-manager worker status T2
 ```
 
 | 项 | 内容 |

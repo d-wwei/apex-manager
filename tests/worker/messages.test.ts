@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { chmodSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import type { TerminalAdapter, WindowHandle } from "../../src/worker/terminal.js";
@@ -78,11 +78,13 @@ function makeUrgentAdapter(sent: string[], keys: string[]): TerminalAdapter {
 describe("structured worker messaging", () => {
   let tmpDir: string;
   let origCwd: string;
+  let origPath: string | undefined;
 
   beforeEach(() => {
     tmpDir = join(tmpdir(), `am-msg-${Date.now()}-${Math.random().toString(36).slice(2)}`);
     mkdirSync(join(tmpDir, ".apex-manager", "workers", "T1"), { recursive: true });
     origCwd = process.cwd();
+    origPath = process.env.PATH;
     process.chdir(tmpDir);
     writeFileSync(join(tmpDir, ".apex-manager", "workers", "T1", "meta.json"), JSON.stringify({
       task_id: "T1",
@@ -96,6 +98,7 @@ describe("structured worker messaging", () => {
 
   afterEach(() => {
     process.chdir(origCwd);
+    process.env.PATH = origPath;
     try {
       rmSync(tmpDir, { recursive: true, force: true });
     } catch {}
@@ -208,5 +211,54 @@ describe("structured worker messaging", () => {
     assert.deepStrictEqual(keys, ["C-c"]);
     assert.strictEqual(sent.length, 1);
     assert.ok(sent[0].includes("[PLAN-AGENT:INTERRUPT]"));
+  });
+
+  it("uses the worker's recorded cmux adapter when no adapter override is provided", async () => {
+    const logPath = join(tmpDir, "cmux.log");
+    const binDir = join(tmpDir, "bin");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(binDir, "cmux"), `#!/bin/sh
+echo "$@" >> "$CMUX_LOG"
+case "$1" in
+  read-screen)
+    echo "$ ready"
+    exit 0
+    ;;
+  send|send-key|--version|ping)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`);
+    chmodSync(join(binDir, "cmux"), 0o755);
+    process.env.PATH = `${binDir}:${origPath ?? ""}`;
+    process.env.CMUX_LOG = logPath;
+
+    writeFileSync(join(tmpDir, ".apex-manager", "workers", "T1", "meta.json"), JSON.stringify({
+      task_id: "T1",
+      window_handle: { id: "surface-9", name: "T1-auth", adapter: "cmux" },
+      worktree_path: ".apex-manager/worktrees/T1",
+      branch: "apex-mgr/T1",
+      started_at: new Date().toISOString(),
+      agent: "codex",
+    }, null, 2));
+
+    const { sendStructuredMessage } = await import("../../src/worker/messages.js");
+    const message = await sendStructuredMessage({
+      from: "manager",
+      to: "T1",
+      taskId: "T1",
+      kind: "directive",
+      body: "Switch plans.",
+      directiveAction: "info",
+    });
+
+    assert.strictEqual(message.delivery_status, "delivered");
+
+    const log = readFileSync(logPath, "utf-8");
+    assert.ok(log.includes("read-screen surface-9 --lines 20"));
+    assert.ok(log.includes("send surface-9 [PLAN-AGENT]"));
   });
 });

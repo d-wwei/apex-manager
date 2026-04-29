@@ -99,17 +99,7 @@ export async function discoverWorkers(state: DaemonState): Promise<void> {
 }
 
 export async function processMessageQueue(state: DaemonState): Promise<void> {
-  let adapter = state.adapter;
-  if (!adapter) {
-    try {
-      adapter = detectAdapter();
-      state.adapter = adapter;
-    } catch {
-      return;
-    }
-  }
-
-  await processMessageQueueOnce({ adapter });
+  await processMessageQueueOnce();
 }
 
 // ── Tick ────────────────────────────────────────────────────────────────
