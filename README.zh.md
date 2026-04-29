@@ -38,6 +38,10 @@ Apex Manager 是一个 CLI 工具，基于三层架构：
 
 - **跨模型共识。** `--cross-model` 让同一个任务跑多个 Agent，结果自动综合去重。安全审查、架构评审 —— 多一个视角的成本远低于漏掉一个 bug。
 
+- **空闲感知消息投递。** Worker 忙时，普通消息先排队；紧急消息先中断，再安全注入。ACK 既可以通过 `--wait-ack` 同步观察，也可以由 daemon 在后台自动收敛。
+
+- **事件驱动恢复。** Task / Artifact / Message / Worker 的生命周期都会写入 `events.jsonl`，并反推 `state.snapshot.json`，这样 daemon 重启后能恢复团队上下文。
+
 - **任务粒度的成本追踪。** 按 Worker 统计 Token 用量，按模型计价（Opus、Sonnet、Haiku）。预算预警和硬上限。每条并行工作流花了多少钱，一清二楚。
 
 ## 对比
@@ -84,6 +88,7 @@ Apex Manager 是一个 CLI 工具，基于三层架构：
 **阶段一 —— 启动 Worker 和 Daemon：**
 
 ```bash
+apex-manager init
 apex-manager worker spawn T1 --agent claude --protocol apex-forge
 apex-manager worker spawn T2 --agent codex
 apex-manager orch start
@@ -93,7 +98,10 @@ apex-manager orch start
 
 ```bash
 apex-manager orch status
-apex-manager worker directive T1 amend "补充边界情况 X 的处理" --urgent
+apex-manager worker tell T1 "合并前再检查一下 empty state。"
+apex-manager worker inject T1 "停止当前方案，改用新的 API 结构。" --urgent
+apex-manager msg list --to T1 --status pending
+apex-manager orch events --tail 20
 apex-manager worker status T1      # 读终端输出
 apex-manager worker interrupt T1   # 中断 Agent
 ```
@@ -123,6 +131,12 @@ apex-manager orch stop
 .apex-manager/
 ├── config.yaml              # 配置
 ├── tasks.json               # 任务 DAG
+├── events.jsonl             # 追加写入的团队事件账本
+├── state.snapshot.json      # 从事件重建的 Team Kernel 快照
+├── artifacts/
+│   └── index.json           # 通用制品索引
+├── messages/
+│   └── index.json           # 结构化团队消息
 ├── workers/
 │   └── T1/
 │       ├── meta.json        # worktree 路径、分支、Agent 类型
@@ -132,7 +146,7 @@ apex-manager orch stop
 │       └── directive.json   # Plan Agent → Worker 的指令
 ├── notifications/           # Daemon → Plan Agent 通知队列
 ├── orch.lock                # 单 daemon 保证
-└── event-log.jsonl          # 审计日志
+└── event-log.jsonl          # 兼容保留的审计镜像
 ```
 
 ## 快速开始
@@ -144,25 +158,54 @@ apex-manager orch stop
 git clone <repo-url>
 cd apex-manager && npm install
 
-# 2. 启动一个 Worker
+# 2. 初始化本地状态
+npx tsx src/cli.ts init
+
+# 3. 启动一个 Worker
 npx tsx src/cli.ts worker spawn T1 --agent claude
 
-# 3. 启动 Daemon
+# 4. 启动 Daemon
 npx tsx src/cli.ts orch start
 
-# 4. 查看状态
+# 5. 查看状态
 npx tsx src/cli.ts orch status
 ```
 
 ### CLI 速查
 
 ```bash
+# 初始化
+apex-manager init
+
+# Task 命令
+apex-manager task create <title> [description...] [--depends <task-id>] [--agent <agent>] [--protocol <skill>] [--category <cat>]
+apex-manager task list
+apex-manager task status <task-id>
+apex-manager task claim <task-id> [--by <worker-id>]
+apex-manager task complete <task-id> [--by <worker-id>] [--summary <summary>] [--evidence <artifact-id>]
+apex-manager task block <task-id> --reason <reason> [--by <worker-id>]
+
+# Artifact 命令
+apex-manager artifact submit <task-id> --by <worker-id> --type <type> --path <path> --summary <summary>
+apex-manager artifact list [task-id]
+apex-manager artifact show <artifact-id>
+
+# 消息命令
+apex-manager msg send <to> <body> [--from <sender>] [--kind <directive|question|info>] [--task <task-id>] [--priority <normal|urgent>] [--action <amend|pause|abort|info>] [--no-ack] [--wait-ack]
+apex-manager msg send --from <sender> --to <target> --kind <kind> --body <text>
+apex-manager msg list [--to <task-id>] [--status <pending|delivered|acked|ack_timeout|failed>]
+apex-manager msg show <message-id>
+apex-manager msg ack <message-id> [--by <worker-id>]
+
 # Worker 命令
 apex-manager worker spawn <id> [--agent claude|codex|gemini|opencode] [--protocol <skill>] [--cross-model]
 apex-manager worker kill <id>
 apex-manager worker list
 apex-manager worker status <id>
 apex-manager worker interrupt <id>
+apex-manager worker tell <id> <message> [--wait-ack]
+apex-manager worker ask <id> <question> [--wait-ack]
+apex-manager worker inject <id> <message> [--urgent]
 apex-manager worker directive <id> <amend|pause|abort|info> <content> [--urgent]
 apex-manager worker merge <id> [--strategy local|pr|squash]
 apex-manager worker merge-all
@@ -173,6 +216,8 @@ apex-manager worker report          # 成本报告
 apex-manager orch start [--force]
 apex-manager orch stop
 apex-manager orch status
+apex-manager orch events [--tail <n>] [--type <event-type>]
+apex-manager orch snapshot [--rebuild]
 ```
 
 ## 项目结构
@@ -182,7 +227,11 @@ apex-manager/
 ├── src/
 │   ├── cli.ts                    # 入口 —— 命令路由
 │   ├── commands/
-│   │   ├── worker.ts             # spawn / kill / merge / interrupt / directive
+│   │   ├── init.ts               # 项目状态初始化
+│   │   ├── task.ts               # Task 生命周期命令
+│   │   ├── artifact.ts           # 通用制品命令
+│   │   ├── msg.ts                # 结构化团队消息
+│   │   ├── worker.ts             # Worker 生命周期 + 消息 + 合并
 │   │   └── orch.ts               # Daemon 生命周期 + 锁管理
 │   ├── daemon/
 │   │   ├── daemon.ts             # Tick 循环：监控 → 测试 → 合并 → 启动
@@ -191,6 +240,8 @@ apex-manager/
 │   ├── worker/
 │   │   ├── protocol-builder.ts   # 为每个 Worker 组装工作指令
 │   │   ├── agent-adapter.ts      # Agent 特定的 CLI 知识
+│   │   ├── messages.ts           # 结构化终端消息投递
+│   │   ├── idle.ts               # 空闲 / 忙碌检测启发式
 │   │   ├── terminal.ts           # tmux / cmux 抽象层
 │   │   ├── monitor.ts            # 健康检查 + 状态读取
 │   │   ├── cross-model.ts        # 多 Agent 结果综合
@@ -198,11 +249,16 @@ apex-manager/
 │   │   └── proxy.ts              # 速率限制提取
 │   ├── types/
 │   │   ├── config.ts             # 配置 schema + 默认值
-│   │   └── task.ts               # 任务模型 + 状态机
+│   │   ├── task.ts               # 任务模型 + 状态机
+│   │   ├── artifact.ts           # 制品元数据模型
+│   │   ├── message.ts            # 消息元数据模型
+│   │   └── state.ts              # 事件账本 + 快照模型
 │   └── utils/
 │       ├── config.ts             # YAML 配置加载
 │       ├── json.ts               # 原子 JSON 读写
-│       └── logger.ts             # 事件日志
+│       ├── logger.ts             # 事件日志
+│       ├── events.ts             # 事件账本 + 快照重建
+│       └── project-state.ts      # 本地状态布局 + 默认值
 ├── roles/
 │   └── manager.md                # Plan Agent 角色定义
 ├── SKILL.md                      # Skill 激活指南

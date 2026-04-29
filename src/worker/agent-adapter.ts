@@ -1,9 +1,8 @@
 /**
  * Agent adapter — config-driven agent registry.
  *
- * Agents are defined in .apex-manager/agents.json.  Only "claude" has a
- * built-in fallback for zero-config usage; all other agents (codex,
- * gemini, ft-claude, custom tools) must be declared in agents.json.
+ * Agents are defined in .apex-manager/agents.json.
+ * Common local CLIs also have built-in defaults for zero-config usage.
  */
 
 import { existsSync, readFileSync } from "fs";
@@ -117,15 +116,18 @@ const AGENTS_JSON_PATH = ".apex-manager/agents.json";
 
 /**
  * Load agents.json from the project directory.
- * Returns empty map if file does not exist.
+ * Returns built-in defaults when file does not exist.
  */
 export function loadAgentsConfig(): AgentsMap {
-  if (!existsSync(AGENTS_JSON_PATH)) return {};
+  if (!existsSync(AGENTS_JSON_PATH)) return { ...DEFAULT_AGENTS };
   try {
     const raw = readFileSync(AGENTS_JSON_PATH, "utf-8");
-    return JSON.parse(raw) as AgentsMap;
+    return {
+      ...DEFAULT_AGENTS,
+      ...(JSON.parse(raw) as AgentsMap),
+    };
   } catch {
-    return {};
+    return { ...DEFAULT_AGENTS };
   }
 }
 
@@ -145,8 +147,7 @@ const ENTRY_DEFAULTS: Required<Omit<AgentEntry, "command">> = {
 };
 
 /**
- * The claude fallback entry — used when no agents.json exists or when
- * "claude" is requested but not explicitly defined in config.
+ * The claude fallback entry — kept for backward compatibility helpers.
  */
 const CLAUDE_FALLBACK_ENTRY: AgentEntry = {
   command: "claude",
@@ -185,7 +186,7 @@ export function buildAdapterFromEntry(name: string, entry: AgentEntry): AgentAda
       protocolInjection = { type: "system-prompt-file", flag: protocolFlag };
       break;
     case "post-create-send":
-      protocolInjection = { type: "none" };
+      protocolInjection = { type: "stdin" };
       needsPostCreateSend = true;
       break;
     default:
@@ -230,29 +231,26 @@ export function buildAdapterFromEntry(name: string, entry: AgentEntry): AgentAda
 /**
  * Resolve an agent adapter.
  *
- * Priority: agents.json > claude fallback > error.
+ * Priority: agents.json > built-in defaults > error.
  */
 export function resolveAdapterWithConfig(
   agent: string,
   configAgents: AgentsMap | undefined,
 ): AgentAdapter {
-  const entry = configAgents?.[agent];
+  const builtin = DEFAULT_AGENTS[agent];
+  const override = configAgents?.[agent];
+  const entry = builtin ? { ...builtin, ...override } : override;
 
-  // Case 1: found in config
   if (entry) {
     return buildAdapterFromEntry(agent, entry);
   }
 
-  // Case 2: "claude" requested but not in config — use built-in fallback
-  if (agent === "claude") {
-    return buildAdapterFromEntry("claude", CLAUDE_FALLBACK_ENTRY);
-  }
-
-  // Case 3: unknown agent
-  const available = configAgents ? Object.keys(configAgents) : [];
-  if (!available.includes("claude")) available.push("claude");
+  const available = new Set<string>([
+    ...Object.keys(DEFAULT_AGENTS),
+    ...Object.keys(configAgents ?? {}),
+  ]);
   throw new Error(
-    `Unknown agent "${agent}". Define it in .apex-manager/agents.json. Available: ${available.join(", ")}`,
+    `Unknown agent "${agent}". Define it in .apex-manager/agents.json. Available: ${[...available].join(", ")}`,
   );
 }
 
@@ -268,11 +266,8 @@ export function resolveAdapter(agent: string): AgentAdapter {
 /**
  * @deprecated Use loadAgentsConfig() + resolveAdapterWithConfig() instead.
  * Kept for callers that reference BUILTIN_ADAPTERS directly.
- * Returns only the claude fallback.
  */
-export const BUILTIN_ADAPTERS: Record<string, AgentAdapter> = {
-  claude: buildAdapterFromEntry("claude", CLAUDE_FALLBACK_ENTRY),
-};
+let BUILTIN_ADAPTERS: Record<string, AgentAdapter>;
 
 /**
  * Default agent entries for `apex-manager init` to write to agents.json.
@@ -280,6 +275,15 @@ export const BUILTIN_ADAPTERS: Record<string, AgentAdapter> = {
 export const DEFAULT_AGENTS: AgentsMap = {
   claude: {
     command: "claude",
+    protocol: "system-prompt-file",
+    protocol_flag: "--append-system-prompt-file",
+    interrupt: "esc",
+    language: "zh",
+    env_forward: true,
+    auto_approval_flag: "--dangerously-skip-permissions",
+  },
+  "ft-claude": {
+    command: "ft-claude",
     protocol: "system-prompt-file",
     protocol_flag: "--append-system-prompt-file",
     interrupt: "esc",
@@ -308,3 +312,9 @@ export const DEFAULT_AGENTS: AgentsMap = {
     language: "en",
   },
 };
+
+BUILTIN_ADAPTERS = Object.fromEntries(
+  Object.entries(DEFAULT_AGENTS).map(([name, entry]) => [name, buildAdapterFromEntry(name, entry)]),
+);
+
+export { BUILTIN_ADAPTERS };

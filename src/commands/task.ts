@@ -3,6 +3,8 @@ import { join } from "path";
 import { readJSON, writeJSON } from "../utils/json.js";
 import type { Task, TaskStatus, TaskStore } from "../types/task.js";
 import { ALLOWED_TRANSITIONS } from "../types/task.js";
+import { recordKernelEvent } from "../utils/events.js";
+import { ensureProjectLayout } from "../utils/project-state.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -15,6 +17,7 @@ function storePath(): string {
 }
 
 async function loadStore(): Promise<TaskStore> {
+  ensureProjectLayout();
   return readJSON<TaskStore>(storePath(), { tasks: [], next_id: 1 });
 }
 
@@ -90,6 +93,7 @@ async function cmdCreate(args: string[]): Promise<void> {
     depends_on: depends,
     blocked_by: [],
     evidence: [],
+    artifacts: [],
     created_at: now,
     updated_at: now,
     ...(agent ? { agent } : {}),
@@ -100,6 +104,11 @@ async function cmdCreate(args: string[]): Promise<void> {
   store.tasks.push(task);
   store.next_id++;
   await saveStore(store);
+  await recordKernelEvent({
+    type: "task.created",
+    timestamp: task.created_at,
+    task: { ...task },
+  });
 
   console.log(`${id}: ${title}`);
 }
@@ -159,6 +168,12 @@ async function cmdStatus(args: string[]): Promise<void> {
   if (task.evidence.length > 0) {
     lines.push(`  Evidence: ${task.evidence.join(", ")}`);
   }
+  if (task.artifacts && task.artifacts.length > 0) {
+    lines.push(`  Artifacts: ${task.artifacts.join(", ")}`);
+  }
+  if (task.claimed_by) lines.push(`  Claimed by: ${task.claimed_by}`);
+  if (task.completed_by) lines.push(`  Completed by: ${task.completed_by}`);
+  if (task.completion_summary) lines.push(`  Completion summary: ${task.completion_summary}`);
   lines.push(`  Created: ${task.created_at}`);
   lines.push(`  Updated: ${task.updated_at}`);
   if (task.completed_at) lines.push(`  Completed: ${task.completed_at}`);
@@ -213,8 +228,134 @@ async function cmdUpdate(args: string[]): Promise<void> {
 
   task.updated_at = new Date().toISOString();
   await saveStore(store);
+  await recordKernelEvent({
+    type: "task.updated",
+    timestamp: task.updated_at,
+    reason: "update",
+    task: { ...task },
+  });
 
   console.log(`${taskId} updated (status: ${task.status})`);
+}
+
+async function cmdClaim(args: string[]): Promise<void> {
+  const taskId = args[0];
+  const by = flagValue(args, "--by");
+
+  if (!taskId) {
+    console.error("Usage: apex-manager task claim <task-id> [--by <worker-id>]");
+    process.exit(1);
+  }
+
+  const store = await loadStore();
+  const task = findTask(store, taskId);
+  if (!task) {
+    console.error(`Task ${taskId} not found`);
+    process.exit(1);
+  }
+
+  if (!(task.status === "open" || task.status === "assigned")) {
+    console.error(`Cannot claim ${taskId} from status '${task.status}'`);
+    process.exit(1);
+  }
+
+  task.previous_status = task.status;
+  task.status = "in_progress";
+  task.claimed_by = by ?? task.claimed_by;
+  task.claimed_at = new Date().toISOString();
+  task.updated_at = task.claimed_at;
+  await saveStore(store);
+  await recordKernelEvent({
+    type: "task.updated",
+    timestamp: task.updated_at,
+    reason: "claim",
+    task: { ...task },
+  });
+
+  console.log(`${taskId} claimed`);
+}
+
+async function cmdComplete(args: string[]): Promise<void> {
+  const taskId = args[0];
+  const by = flagValue(args, "--by");
+  const summary = flagValue(args, "--summary");
+  const evidence = flagValues(args, "--evidence");
+
+  if (!taskId) {
+    console.error("Usage: apex-manager task complete <task-id> [--by <worker-id>] [--summary <summary>] [--evidence <artifact-id>]");
+    process.exit(1);
+  }
+
+  const store = await loadStore();
+  const task = findTask(store, taskId);
+  if (!task) {
+    console.error(`Task ${taskId} not found`);
+    process.exit(1);
+  }
+
+  if (!(task.status === "in_progress" || task.status === "to_verify")) {
+    console.error(`Cannot complete ${taskId} from status '${task.status}'`);
+    process.exit(1);
+  }
+
+  task.previous_status = task.status;
+  task.status = "done";
+  task.completed_at = new Date().toISOString();
+  task.updated_at = task.completed_at;
+  task.completed_by = by ?? task.completed_by;
+  task.completion_summary = summary ?? task.completion_summary;
+  if (evidence.length > 0) {
+    task.evidence.push(...evidence);
+  }
+  await saveStore(store);
+  await recordKernelEvent({
+    type: "task.updated",
+    timestamp: task.updated_at,
+    reason: "complete",
+    task: { ...task },
+  });
+
+  console.log(`${taskId} completed`);
+}
+
+async function cmdBlock(args: string[]): Promise<void> {
+  const taskId = args[0];
+  const by = flagValue(args, "--by");
+  const reason = flagValue(args, "--reason");
+
+  if (!taskId || !reason) {
+    console.error("Usage: apex-manager task block <task-id> --reason <reason> [--by <worker-id>]");
+    process.exit(1);
+  }
+
+  const store = await loadStore();
+  const task = findTask(store, taskId);
+  if (!task) {
+    console.error(`Task ${taskId} not found`);
+    process.exit(1);
+  }
+
+  if (task.status === "done") {
+    console.error(`Cannot block completed task ${taskId}`);
+    process.exit(1);
+  }
+
+  task.previous_status = task.status;
+  task.status = "blocked";
+  task.block_reason = reason;
+  if (by) {
+    task.blocked_by.push(by);
+  }
+  task.updated_at = new Date().toISOString();
+  await saveStore(store);
+  await recordKernelEvent({
+    type: "task.updated",
+    timestamp: task.updated_at,
+    reason: "block",
+    task: { ...task },
+  });
+
+  console.log(`${taskId} blocked`);
 }
 
 // ── Help ─────────────────────────────────────────────────────────────
@@ -237,6 +378,15 @@ Usage:
 
   apex-manager task status <task-id>
     Show detailed task info.
+
+  apex-manager task claim <task-id> [--by <worker-id>]
+    Mark a task as claimed/in progress.
+
+  apex-manager task complete <task-id> [--by <worker-id>] [--summary <summary>] [--evidence <artifact>]
+    Mark a task completed with optional evidence.
+
+  apex-manager task block <task-id> --reason <reason> [--by <worker-id>]
+    Mark a task blocked with a reason.
 
   apex-manager task update <task-id> [options]
     Update task fields.
@@ -263,6 +413,15 @@ export async function cmdTask(args: string[]): Promise<void> {
       break;
     case "status":
       await cmdStatus(args.slice(1));
+      break;
+    case "claim":
+      await cmdClaim(args.slice(1));
+      break;
+    case "complete":
+      await cmdComplete(args.slice(1));
+      break;
+    case "block":
+      await cmdBlock(args.slice(1));
       break;
     case "update":
       await cmdUpdate(args.slice(1));

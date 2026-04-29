@@ -12,9 +12,12 @@ import { listWorkers, checkWorkerHealth, getMonitorReport } from "../worker/moni
 import { formatCostReport, formatRateLimitStatus } from "../worker/cost.js";
 import { readCostSummary, readRateLimit } from "../worker/proxy.js";
 import { loadConfig } from "../utils/config.js";
+import { recordKernelEvent } from "../utils/events.js";
 import { checkAgent, checkAllAgents } from "../worker/capability-check.js";
 import { loadAgentsConfig, resolveAdapterWithConfig } from "../worker/agent-adapter.js";
 import { interruptKeys } from "../worker/interrupt.js";
+import { sendStructuredMessage } from "../worker/messages.js";
+import { isWorkerIdleScreen } from "../worker/idle.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -59,6 +62,11 @@ function hasFlag(args: string[], flag: string): boolean {
   return args.includes(flag);
 }
 
+function flagValue(args: string[], flag: string): string | undefined {
+  const idx = args.indexOf(flag);
+  return idx >= 0 && args[idx + 1] ? args[idx + 1] : undefined;
+}
+
 function findTask(tasks: Task[], taskId: string): Task | undefined {
   return tasks.find((t) => t.id === taskId);
 }
@@ -73,7 +81,7 @@ async function cmdSpawn(args: string[]): Promise<void> {
   const agentValueIdx = agentIdx >= 0 ? agentIdx + 1 : -1;
   const taskId = args.find((a, i) => !a.startsWith("--") && i !== agentValueIdx);
   if (!taskId) {
-    console.error("Usage: apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--cross-model] [--dry-run]");
+    console.error("Usage: apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--protocol <skill>] [--cross-model] [--dry-run]");
     process.exit(1);
   }
 
@@ -170,6 +178,7 @@ async function cmdSpawn(args: string[]): Promise<void> {
     completedDeps,
     crossModel,
     agent,
+    protocol: flagValue(args, "--protocol") ?? task.protocol,
     isolated,
   };
 
@@ -220,6 +229,11 @@ async function cmdSpawn(args: string[]): Promise<void> {
   // 10. Update meta with window handle
   meta.window_handle = handle;
   await writeJSON(join(workersDir, "meta.json"), meta);
+  await recordKernelEvent({
+    type: "worker.registered",
+    timestamp: new Date().toISOString(),
+    worker: { ...meta },
+  });
 
   // 11. Print confirmation
   console.log(`Worker ${taskId} spawned in window ${windowName} (agent: ${agent}, worktree: ${worktreeRel})`);
@@ -272,6 +286,11 @@ async function cmdKill(args: string[]): Promise<void> {
   // 4. Remove worker directory
   const workersDir = join(projectRoot, ".apex-manager", "workers", taskId);
   rmSync(workersDir, { recursive: true, force: true });
+  await recordKernelEvent({
+    type: "worker.removed",
+    timestamp: new Date().toISOString(),
+    worker_id: taskId,
+  });
 
   // 5. Print confirmation
   console.log(`Worker ${taskId} killed and cleaned up`);
@@ -339,14 +358,7 @@ async function cmdInterrupt(args: string[]): Promise<void> {
 }
 
 function isAgentIdle(screen: string, agent: string): boolean {
-  switch (agent) {
-    case "claude":
-      return screen.includes("\u276f") && !screen.includes("esc to interrupt");
-    case "codex":
-    case "gemini":
-    default:
-      return screen.includes("$") || screen.includes("\u276f");
-  }
+  return isWorkerIdleScreen(screen, agent);
 }
 
 // ── directive ──────────────────────────────────────────────────────
@@ -392,6 +404,59 @@ export async function cmdDirective(args: string[]): Promise<void> {
 
   writeFileSync(join(workerDir, "directive.json"), JSON.stringify(directive, null, 2));
   console.log(`Directive written: ${action} → Worker ${taskId}${urgent ? " (urgent)" : ""}`);
+}
+
+async function cmdTellLike(
+  args: string[],
+  kind: "directive" | "question",
+  directiveAction: "amend" | "info",
+): Promise<void> {
+  const taskId = args[0];
+  const body = args.slice(1).filter((arg) => !arg.startsWith("--")).join(" ");
+  const waitForAck = hasFlag(args, "--wait-ack");
+
+  if (!taskId || !body) {
+    console.error(`Usage: apex-manager worker ${kind === "question" ? "ask" : "tell"} <task-id> <message> [--wait-ack]`);
+    process.exit(1);
+  }
+
+  const message = await sendStructuredMessage({
+    from: "manager",
+    to: taskId,
+    taskId,
+    kind,
+    priority: "normal",
+    ackRequired: true,
+    body,
+    directiveAction,
+    waitForAck,
+  });
+
+  console.log(`${message.id} ${message.delivery_status} for ${taskId}`);
+}
+
+async function cmdInject(args: string[]): Promise<void> {
+  const taskId = args[0];
+  const body = args.slice(1).filter((arg) => !arg.startsWith("--")).join(" ");
+  const urgent = hasFlag(args, "--urgent");
+
+  if (!taskId || !body) {
+    console.error("Usage: apex-manager worker inject <task-id> <message> [--urgent]");
+    process.exit(1);
+  }
+
+  const message = await sendStructuredMessage({
+    from: "manager",
+    to: taskId,
+    taskId,
+    kind: "directive",
+    priority: urgent ? "urgent" : "normal",
+    ackRequired: true,
+    body,
+    directiveAction: "amend",
+  });
+
+  console.log(`${message.id} ${message.delivery_status} for ${taskId}`);
 }
 
 // ── merge ───────────────────────────────────────────────────────────
@@ -598,10 +663,16 @@ function printHelp(): void {
 apex-manager worker — manage parallel worker agents
 
 Usage:
-  apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--cross-model] [--dry-run]
+  apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--protocol <skill>] [--cross-model] [--dry-run]
                                 Spawn a worker agent for a task
   apex-manager worker kill <task-id>    Kill worker and clean up worktree
   apex-manager worker interrupt <task-id> Send interrupt signal to worker
+  apex-manager worker tell <task-id> <message> [--wait-ack]
+                                Send a structured manager message to a worker
+  apex-manager worker ask <task-id> <question> [--wait-ack]
+                                Send a structured question to a worker
+  apex-manager worker inject <task-id> <message> [--urgent]
+                                Inject a structured directive with terminal delivery
   apex-manager worker directive <task-id> <action> <content> [--urgent]
                                 Write directive.json (action: amend|pause|abort|info)
   apex-manager worker merge <task-id> [--strategy local|pr|squash]
@@ -632,6 +703,15 @@ export async function cmdWorker(args: string[]): Promise<void> {
       break;
     case "interrupt":
       await cmdInterrupt(args.slice(1));
+      break;
+    case "tell":
+      await cmdTellLike(args.slice(1), "directive", "info");
+      break;
+    case "ask":
+      await cmdTellLike(args.slice(1), "question", "info");
+      break;
+    case "inject":
+      await cmdInject(args.slice(1));
       break;
     case "directive":
       await cmdDirective(args.slice(1));

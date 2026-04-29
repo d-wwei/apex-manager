@@ -11,7 +11,7 @@ import { spawnSync } from "child_process";
 import { existsSync, readFileSync, readdirSync, renameSync } from "fs";
 import { join } from "path";
 import { readJSON } from "../utils/json.js";
-import { appendJSONL } from "../utils/logger.js";
+import { recordKernelEvent } from "../utils/events.js";
 import { autoIntegrate, autoMerge } from "./integrate.js";
 import { notifyPlanAgent } from "./notify.js";
 import { detectAdapter } from "../worker/terminal.js";
@@ -19,6 +19,7 @@ import { checkWorkerHealth } from "../worker/monitor.js";
 import type { WindowHandle, TerminalAdapter } from "../worker/terminal.js";
 import type { WorkerMeta, WorkerResult } from "../worker/monitor.js";
 import type { TaskStore } from "../types/task.js";
+import { processMessageQueueOnce } from "../worker/messages.js";
 
 // ── Types ──────────────────────────────────────────────────────────────
 
@@ -97,6 +98,20 @@ export async function discoverWorkers(state: DaemonState): Promise<void> {
   }
 }
 
+export async function processMessageQueue(state: DaemonState): Promise<void> {
+  let adapter = state.adapter;
+  if (!adapter) {
+    try {
+      adapter = detectAdapter();
+      state.adapter = adapter;
+    } catch {
+      return;
+    }
+  }
+
+  await processMessageQueueOnce({ adapter });
+}
+
 // ── Tick ────────────────────────────────────────────────────────────────
 
 /**
@@ -106,6 +121,7 @@ export async function discoverWorkers(state: DaemonState): Promise<void> {
 export async function tick(state: DaemonState): Promise<void> {
   // Discover any new workers (e.g., spawned by Plan Agent since last tick)
   await discoverWorkers(state);
+  await processMessageQueue(state);
 
   // 1. Check each Worker
   for (const [taskId, worker] of state.workers) {
@@ -139,9 +155,11 @@ export async function tick(state: DaemonState): Promise<void> {
         // Report: verdict != pass, Plan Agent must diagnose
         await notifyPlanAgent(state.adapter, state.planAgentHandle,
           `Worker ${taskId} completed with verdict=${result?.verdict ?? "unknown"}`);
-        appendJSONL(".apex-manager/event-log.jsonl", {
+        await recordKernelEvent({
           type: "orchestration.event",
-          action: "worker_failed", task: taskId, verdict: result?.verdict,
+          action: "worker_failed",
+          task_id: taskId,
+          verdict: result?.verdict,
           timestamp: new Date().toISOString(),
         });
       }
@@ -151,9 +169,10 @@ export async function tick(state: DaemonState): Promise<void> {
     if (health.crashed && !worker.resultChecked) {
       await notifyPlanAgent(state.adapter, state.planAgentHandle,
         `Worker ${taskId} crashed. Screen tail:\n${health.screenTail?.slice(-500) ?? "(unavailable)"}`);
-      appendJSONL(".apex-manager/event-log.jsonl", {
+      await recordKernelEvent({
         type: "orchestration.event",
-        action: "worker_crashed", task: taskId,
+        action: "worker_crashed",
+        task_id: taskId,
         timestamp: new Date().toISOString(),
       });
       worker.resultChecked = true; // Don't re-report
@@ -163,9 +182,10 @@ export async function tick(state: DaemonState): Promise<void> {
     if (health.exitedWithoutResult && !worker.resultChecked) {
       await notifyPlanAgent(state.adapter, state.planAgentHandle,
         `Worker ${taskId} (one-shot) exited without writing result.json. Agent may have failed silently or lacked permissions.`);
-      appendJSONL(".apex-manager/event-log.jsonl", {
+      await recordKernelEvent({
         type: "orchestration.event",
-        action: "worker_exited_no_result", task: taskId,
+        action: "worker_exited_no_result",
+        task_id: taskId,
         timestamp: new Date().toISOString(),
       });
       worker.resultChecked = true;
@@ -178,9 +198,11 @@ export async function tick(state: DaemonState): Promise<void> {
         const esc = JSON.parse(readFileSync(escPath, "utf-8"));
         await notifyPlanAgent(state.adapter, state.planAgentHandle,
           `Worker ${taskId} escalation (${esc.type}): ${esc.summary}`);
-        appendJSONL(".apex-manager/event-log.jsonl", {
+        await recordKernelEvent({
           type: "orchestration.event",
-          action: "escalation_received", task: taskId, escType: esc.type,
+          action: "escalation_received",
+          task_id: taskId,
+          escType: esc.type,
           timestamp: new Date().toISOString(),
         });
         // Mark as processed
@@ -237,9 +259,11 @@ async function spawnUnblockedTasks(state: DaemonState): Promise<void> {
           resultChecked: false,
         });
       }
-      appendJSONL(".apex-manager/event-log.jsonl", {
+      await recordKernelEvent({
         type: "orchestration.event",
-        action: "worker_spawned", task: task.id, agent: meta?.agent,
+        action: "worker_spawned",
+        task_id: task.id,
+        agent: meta?.agent,
         timestamp: new Date().toISOString(),
       });
     } else {

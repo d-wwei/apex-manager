@@ -166,6 +166,31 @@ describe("cmdWorker", () => {
       const output = logOutput.join("\n");
       assert.ok(output.includes("dry-run"));
     });
+
+    it("passes task.protocol through to the protocol builder", async () => {
+      const task = {
+        id: "T1",
+        title: "Build auth API",
+        description: "Implement JWT authentication.\n\nAcceptance Criteria:\n- Login endpoint works",
+        status: "assigned",
+        depends_on: [],
+        blocked_by: [],
+        evidence: [],
+        protocol: "definitely-missing-skill",
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      };
+      writeTasksJson(tmpDir, [task]);
+
+      const { cmdWorker } = await import("../../src/commands/worker.js");
+      try {
+        await cmdWorker(["spawn", "T1", "--dry-run"]);
+      } catch {}
+
+      const protocolPath = join(tmpDir, ".apex-manager", "worktrees", "T1", ".apex-manager", "worker-protocol.md");
+      const content = readFileSync(protocolPath, "utf-8");
+      assert.ok(content.includes("definitely-missing-skill"));
+    });
   });
 
   // --- kill with missing meta.json ---

@@ -36,6 +36,10 @@ Zero runtime dependencies. Pure TypeScript. Works with Claude, ft-claude, Codex,
 
 - **Cross-model consensus.** Run the same task through multiple agents with `--cross-model`. Results are synthesized and deduplicated. For security audits, architecture reviews, or anything where a second opinion costs less than a missed bug.
 
+- **Idle-aware team messaging.** Normal messages queue while a worker is busy. Urgent messages interrupt first, then inject safely. ACKs can be observed synchronously with `--wait-ack` or reconciled by the daemon in the background.
+
+- **Event-sourced recovery.** Every task, artifact, message, and worker lifecycle update lands in `events.jsonl`, with `state.snapshot.json` rebuilt from that audit trail so the daemon can restart and recover context.
+
 - **Cost tracking at task granularity.** Per-worker token accounting with model-specific pricing (Opus, Sonnet, Haiku). Budget warnings and hard limits. Know exactly what each parallel workstream costs.
 
 ## Before / After
@@ -82,6 +86,7 @@ No layer does another layer's job. Workers can't orchestrate. The daemon can't m
 **Phase 1 — Kick off workers and daemon:**
 
 ```bash
+apex-manager init
 apex-manager worker spawn T1 --agent claude --protocol apex-forge
 apex-manager worker spawn T2 --agent codex
 apex-manager orch start
@@ -91,7 +96,10 @@ apex-manager orch start
 
 ```bash
 apex-manager orch status
-apex-manager worker directive T1 amend "Also handle edge case X" --urgent
+apex-manager worker tell T1 "Please re-check the empty state before merging."
+apex-manager worker inject T1 "Stop the current approach and use the new API shape." --urgent
+apex-manager msg list --to T1 --status pending
+apex-manager orch events --tail 20
 apex-manager worker status T1      # read terminal output
 apex-manager worker interrupt T1   # stop the agent
 ```
@@ -121,6 +129,12 @@ All state flows through `.apex-manager/`:
 .apex-manager/
 ├── config.yaml              # Settings
 ├── tasks.json               # Task DAG
+├── events.jsonl             # Append-only team event journal
+├── state.snapshot.json      # Rebuilt team kernel snapshot
+├── artifacts/
+│   └── index.json           # Generic artifact index
+├── messages/
+│   └── index.json           # Structured team messages
 ├── workers/
 │   └── T1/
 │       ├── meta.json        # Worktree path, branch, agent type
@@ -130,7 +144,7 @@ All state flows through `.apex-manager/`:
 │       └── directive.json   # Plan Agent → Worker instructions
 ├── notifications/           # Daemon → Plan Agent queue
 ├── orch.lock                # Single-daemon guarantee
-└── event-log.jsonl          # Audit trail
+└── event-log.jsonl          # Legacy audit log mirror
 ```
 
 ## Quick Start
@@ -142,25 +156,54 @@ All state flows through `.apex-manager/`:
 git clone <repo-url>
 cd apex-manager && npm install
 
-# 2. Spawn a worker
+# 2. Initialize local state
+npx tsx src/cli.ts init
+
+# 3. Spawn a worker
 npx tsx src/cli.ts worker spawn T1 --agent claude
 
-# 3. Start the daemon
+# 4. Start the daemon
 npx tsx src/cli.ts orch start
 
-# 4. Check status
+# 5. Check status
 npx tsx src/cli.ts orch status
 ```
 
 ### CLI Reference
 
 ```bash
+# Init
+apex-manager init
+
+# Task commands
+apex-manager task create <title> [description...] [--depends <task-id>] [--agent <agent>] [--protocol <skill>] [--category <cat>]
+apex-manager task list
+apex-manager task status <task-id>
+apex-manager task claim <task-id> [--by <worker-id>]
+apex-manager task complete <task-id> [--by <worker-id>] [--summary <summary>] [--evidence <artifact-id>]
+apex-manager task block <task-id> --reason <reason> [--by <worker-id>]
+
+# Artifact commands
+apex-manager artifact submit <task-id> --by <worker-id> --type <type> --path <path> --summary <summary>
+apex-manager artifact list [task-id]
+apex-manager artifact show <artifact-id>
+
+# Messaging commands
+apex-manager msg send <to> <body> [--from <sender>] [--kind <directive|question|info>] [--task <task-id>] [--priority <normal|urgent>] [--action <amend|pause|abort|info>] [--no-ack] [--wait-ack]
+apex-manager msg send --from <sender> --to <target> --kind <kind> --body <text>
+apex-manager msg list [--to <task-id>] [--status <pending|delivered|acked|ack_timeout|failed>]
+apex-manager msg show <message-id>
+apex-manager msg ack <message-id> [--by <worker-id>]
+
 # Worker commands
 apex-manager worker spawn <id> [--agent claude|codex|gemini|opencode] [--protocol <skill>] [--cross-model]
 apex-manager worker kill <id>
 apex-manager worker list
 apex-manager worker status <id>
 apex-manager worker interrupt <id>
+apex-manager worker tell <id> <message> [--wait-ack]
+apex-manager worker ask <id> <question> [--wait-ack]
+apex-manager worker inject <id> <message> [--urgent]
 apex-manager worker directive <id> <amend|pause|abort|info> <content> [--urgent]
 apex-manager worker merge <id> [--strategy local|pr|squash]
 apex-manager worker merge-all
@@ -171,6 +214,8 @@ apex-manager worker report          # cost report
 apex-manager orch start [--force]
 apex-manager orch stop
 apex-manager orch status
+apex-manager orch events [--tail <n>] [--type <event-type>]
+apex-manager orch snapshot [--rebuild]
 ```
 
 ## Project Structure
@@ -180,7 +225,11 @@ apex-manager/
 ├── src/
 │   ├── cli.ts                    # Entry point — command router
 │   ├── commands/
-│   │   ├── worker.ts             # spawn / kill / merge / interrupt / directive
+│   │   ├── init.ts               # Project state initialization
+│   │   ├── task.ts               # Task lifecycle commands
+│   │   ├── artifact.ts           # Generic artifact commands
+│   │   ├── msg.ts                # Structured team messaging
+│   │   ├── worker.ts             # Worker lifecycle + messaging + merge
 │   │   └── orch.ts               # Daemon lifecycle + lock management
 │   ├── daemon/
 │   │   ├── daemon.ts             # Tick loop: monitor → test → merge → spawn
@@ -189,6 +238,8 @@ apex-manager/
 │   ├── worker/
 │   │   ├── protocol-builder.ts   # Assembles work instructions per worker
 │   │   ├── agent-adapter.ts      # Agent-specific CLI knowledge
+│   │   ├── messages.ts           # Structured terminal message delivery
+│   │   ├── idle.ts               # Idle / busy detection heuristics
 │   │   ├── terminal.ts           # tmux / cmux abstraction
 │   │   ├── monitor.ts            # Health checks + status reading
 │   │   ├── cross-model.ts        # Multi-agent result synthesis
@@ -196,11 +247,16 @@ apex-manager/
 │   │   └── proxy.ts              # Rate limit extraction
 │   ├── types/
 │   │   ├── config.ts             # Configuration schema + defaults
-│   │   └── task.ts               # Task model + status FSM
+│   │   ├── task.ts               # Task model + status FSM
+│   │   ├── artifact.ts           # Artifact metadata model
+│   │   ├── message.ts            # Message metadata model
+│   │   └── state.ts              # Event journal + snapshot model
 │   └── utils/
 │       ├── config.ts             # YAML config loader
 │       ├── json.ts               # Atomic JSON read/write
-│       └── logger.ts             # Event logging
+│       ├── logger.ts             # Event logging
+│       ├── events.ts             # Event journal + snapshot rebuild
+│       └── project-state.ts      # Local state layout + defaults
 ├── roles/
 │   └── manager.md                # Plan Agent role definition
 ├── SKILL.md                      # Skill activation guide
