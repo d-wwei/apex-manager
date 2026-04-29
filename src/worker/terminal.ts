@@ -210,6 +210,13 @@ export class TmuxAdapter implements TerminalAdapter {
     return `${TMUX_SESSION_PREFIX}-${this.sanitizeSessionFragment(name)}-${suffix}`;
   }
 
+  private submit(handle: WindowHandle): void {
+    const result = run("tmux", ["send-keys", "-t", handle.id, "Enter"]);
+    if (!result.ok) {
+      throw new Error(`tmux submit failed: ${result.stderr}`);
+    }
+  }
+
   /**
    * Open a visible terminal window attached to a worker-dedicated tmux session.
    * Auto-detects the user's terminal emulator on macOS; skips silently on
@@ -294,10 +301,12 @@ export class TmuxAdapter implements TerminalAdapter {
   }
 
   async send(handle: WindowHandle, text: string): Promise<void> {
-    const result = run("tmux", ["send-keys", "-t", handle.id, text, "Enter"]);
+    const result = run("tmux", ["send-keys", "-t", handle.id, "-l", text]);
     if (!result.ok) {
       throw new Error(`tmux send-keys failed: ${result.stderr}`);
     }
+    await sleep(60);
+    this.submit(handle);
   }
 
   async readScreen(handle: WindowHandle, lines?: number): Promise<string> {

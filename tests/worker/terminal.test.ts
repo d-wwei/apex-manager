@@ -226,6 +226,15 @@ exit 0
     assert.ok(log.includes("osascript:-e"));
   });
 
+  it("send() submits text and Enter as separate tmux commands", async () => {
+    const adapter = new TmuxAdapter();
+    await adapter.send({ id: "@42", name: "T1-auth", adapter: "tmux" }, "echo ready");
+
+    const log = readFileSync(logPath, "utf-8");
+    assert.ok(log.includes("tmux:send-keys -t @42 -l echo ready"));
+    assert.ok(log.includes("tmux:send-keys -t @42 Enter"));
+  });
+
   it("can inspect tmux client-to-window mappings", () => {
     const info = inspectTmuxHandle({
       id: "@42",

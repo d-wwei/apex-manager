@@ -16,7 +16,7 @@ import type { WorkerMeta, WorkerResult } from "./monitor.js";
 import type { TaskStore } from "../types/task.js";
 import type { ProtocolBuildOptions } from "./protocol-builder.js";
 import { loadAgentsConfig, resolveAdapterWithConfig } from "./agent-adapter.js";
-import { buildWorkerKickoffMessage, verifyWorkerLaunch, waitForKickoffReady } from "./launch.js";
+import { buildWorkerKickoffMessage, ensureKickoffSubmitted, verifyWorkerLaunch, waitForKickoffReady } from "./launch.js";
 
 // Re-export type for findings used in deduplication
 export interface FindingLike {
@@ -162,6 +162,7 @@ export async function spawnCrossModel(
     if (kickoffMessage) {
       await waitForKickoffReady(subId, agent, adapter, handle);
       await adapter.send(handle, kickoffMessage);
+      await ensureKickoffSubmitted(subId, agent, adapter, handle, kickoffMessage);
     }
 
     meta.launch_verification = await verifyWorkerLaunch(projectRoot, subId, null, adapter, handle);

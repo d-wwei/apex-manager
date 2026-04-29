@@ -6,7 +6,7 @@ import type { WorkerMeta } from "./monitor.js";
 import type { AgentAdapter } from "./agent-adapter.js";
 import type { TerminalAdapter, WindowHandle } from "./terminal.js";
 import { inspectTmuxHandle } from "./terminal.js";
-import { waitForWorkerIdle } from "./idle.js";
+import { isWorkerIdleScreen, waitForWorkerIdle } from "./idle.js";
 
 export type LaunchActionSignal = "task_claimed" | "status_updated" | "result_written";
 export type LaunchVerification = NonNullable<WorkerMeta["launch_verification"]>;
@@ -139,5 +139,31 @@ export async function waitForKickoffReady(
     }
   } catch (error) {
     console.warn(`[warn] ${taskId}: unable to confirm worker readiness (${String(error)}); sending kickoff anyway`);
+  }
+}
+
+export async function ensureKickoffSubmitted(
+  taskId: string,
+  agent: string,
+  terminal: TerminalAdapter,
+  handle: WindowHandle,
+  kickoffMessage: string,
+): Promise<void> {
+  const submitKey = terminal.name() === "cmux" ? "enter" : "Enter";
+  const probeNeedles = [
+    "worker-protocol.md",
+    kickoffMessage.slice(0, 48),
+  ].filter((needle) => needle.length > 0);
+
+  try {
+    await sleep(300);
+    const screen = await terminal.readScreen(handle, 20);
+    const kickoffStillVisible = probeNeedles.some((needle) => screen.includes(needle));
+    if (kickoffStillVisible && isWorkerIdleScreen(screen, agent)) {
+      console.warn(`[warn] ${taskId}: kickoff text still appears idle in the terminal; sending an extra submit key`);
+      await terminal.sendKey(handle, submitKey);
+    }
+  } catch {
+    // Best-effort safeguard only.
   }
 }

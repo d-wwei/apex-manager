@@ -20,7 +20,7 @@ import { loadAgentsConfig, resolveAdapterWithConfig } from "../worker/agent-adap
 import { interruptKeys } from "../worker/interrupt.js";
 import { sendStructuredMessage } from "../worker/messages.js";
 import { isWorkerIdleScreen, waitForWorkerIdle } from "../worker/idle.js";
-import { buildWorkerKickoffMessage, verifyWorkerLaunch, waitForKickoffReady } from "../worker/launch.js";
+import { buildWorkerKickoffMessage, ensureKickoffSubmitted, verifyWorkerLaunch, waitForKickoffReady } from "../worker/launch.js";
 
 export { buildWorkerKickoffMessage } from "../worker/launch.js";
 
@@ -259,6 +259,7 @@ async function cmdSpawn(args: string[]): Promise<void> {
   if (kickoffMessage) {
     await waitForKickoffReady(taskId, agent, terminal, handle);
     await terminal.send(handle, kickoffMessage);
+    await ensureKickoffSubmitted(taskId, agent, terminal, handle, kickoffMessage);
   }
 
   // 11. Verify actual launch activity, not just a visible prompt.
