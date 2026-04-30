@@ -135,7 +135,7 @@ describe("Money-Come-To-Eli war room", () => {
   });
 
   it("runs the skill launcher script against the repo-local CLI", () => {
-    const scriptPath = join(repoRoot, "skills", "Money-Come-To-Eli", "scripts", "launch.sh");
+    const scriptPath = join(repoRoot, "skills", "money-come-to-eli", "scripts", "launch.sh");
     const result = spawnSync("bash", [scriptPath, "--once"], {
       cwd: tmpDir,
       encoding: "utf-8",

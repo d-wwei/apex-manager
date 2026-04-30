@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_NAME="apex-manager"
-EASTER_EGG_SKILL_NAME="Money-Come-To-Eli"
+EASTER_EGG_SKILL_NAME="money-come-to-eli"
 EASTER_EGG_SKILL_DIR="$SCRIPT_DIR/skills/$EASTER_EGG_SKILL_NAME"
 
 echo "Installing $SKILL_NAME..."
@@ -17,6 +17,12 @@ for base in ~/.agents/skills ~/.claude/skills ~/.codex/skills ~/.gemini/skills; 
   else
     ln -s "$SCRIPT_DIR" "$target"
     echo "  ✓ $target → $SCRIPT_DIR"
+  fi
+
+  legacy_egg_target="$base/Money-Come-To-Eli"
+  if [ -L "$legacy_egg_target" ]; then
+    rm -f "$legacy_egg_target"
+    echo "  ✓ removed legacy $legacy_egg_target"
   fi
 
   egg_target="$base/$EASTER_EGG_SKILL_NAME"
@@ -37,4 +43,6 @@ fi
 # Make CLI available
 npm link 2>/dev/null || true
 
-echo "Done. Use /apex-manager or /Money-Come-To-Eli in your AI agent."
+echo "Done. Use /apex-manager and:"
+echo "  Claude Code: /money-come-to-eli"
+echo "  Codex: /skills or \$money-come-to-eli"

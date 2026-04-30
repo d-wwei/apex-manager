@@ -1,15 +1,20 @@
 ---
-name: Money-Come-To-Eli
+name: money-come-to-eli
 description: Launch the hidden Apex Manager war-room easter egg in a separate terminal window without blocking the current agent session.
 ---
 
-# Money-Come-To-Eli
+# money-come-to-eli
 
-When `/Money-Come-To-Eli` is invoked:
+When this skill is explicitly invoked:
 
 1. Launch the hidden Apex Manager war-room in a separate terminal window.
 2. Do not keep the current Claude Code or Codex session blocked by the dashboard.
 3. Use the repo-local launcher so the command works even if the user's PATH has not refreshed yet.
+
+Invocation:
+
+- Claude Code: `/money-come-to-eli`
+- Codex: `$money-come-to-eli` or select it from `/skills`
 
 ## Command
 
