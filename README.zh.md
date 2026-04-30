@@ -1,4 +1,4 @@
-[English](README.md) | [中文](README.zh.md)
+[仓库首页](README.md) | [English CLI Docs](docs/reference/README.en.md)
 
 # Apex Manager
 
