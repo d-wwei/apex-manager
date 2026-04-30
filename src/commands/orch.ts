@@ -12,6 +12,7 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { createDaemonState, runDaemon } from "../daemon/daemon.js";
 import { readPendingNotifications } from "../daemon/notify.js";
 import { readKernelEvents, readProjectSnapshot, rebuildProjectSnapshotFromEvents } from "../utils/events.js";
+import { runMoneyComeToEli } from "../orch/war-room.js";
 import type { WindowHandle } from "../worker/terminal.js";
 
 const LOCK_PATH = ".apex-manager/orch.lock";
@@ -260,8 +261,9 @@ async function cmdSnapshot(args: string[]): Promise<void> {
 export async function cmdOrch(args: string[]): Promise<void> {
   const sub = args[0];
   const rest = args.slice(1);
+  const normalizedSub = sub?.toLowerCase();
 
-  switch (sub) {
+  switch (normalizedSub) {
     case "start":
       await cmdStart(rest);
       break;
@@ -276,6 +278,9 @@ export async function cmdOrch(args: string[]): Promise<void> {
       break;
     case "snapshot":
       await cmdSnapshot(rest);
+      break;
+    case "money-come-to-eli":
+      await runMoneyComeToEli(rest);
       break;
     default:
       console.log("Usage: apex-manager orch <start|stop|status|events|snapshot> [--force]");
