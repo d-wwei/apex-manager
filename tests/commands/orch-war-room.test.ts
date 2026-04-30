@@ -120,7 +120,8 @@ describe("Money-Come-To-Eli war room", () => {
     const { moneyComeToEliForegroundCommand } = await import("../../src/orch/war-room.js");
     const command = moneyComeToEliForegroundCommand(tmpDir);
 
-    assert.ok(command.includes("bin/apex-manager.sh"));
+    assert.ok(command.includes(join(repoRoot, "bin", "apex-manager.sh")), command);
+    assert.ok(!command.includes(join(tmpDir, "bin", "apex-manager.sh")), command);
     assert.ok(command.includes("orch Money-Come-To-Eli --foreground"));
     assert.ok(command.includes(tmpDir));
   });
@@ -177,7 +178,8 @@ exit 0
 
     const log = readFileSync(logPath, "utf-8");
     assert.ok(log.includes('tell application "Terminal" to do script'));
-    assert.ok(log.includes("bin/apex-manager.sh"));
+    assert.ok(log.includes(join(repoRoot, "bin", "apex-manager.sh")), log);
+    assert.ok(!log.includes(join(tmpDir, "bin", "apex-manager.sh")), log);
   });
 
   it("renders a one-shot war room screen through the orch command", async () => {
@@ -196,5 +198,26 @@ exit 0
     assert.ok(combined.includes("Build war room"));
     assert.ok(combined.includes("Worker T1 needs judgment"));
     assert.ok(combined.includes("pending_messages=1"));
+  });
+
+  it("keeps rendering when a worker disappears before health inspection", async () => {
+    writeFileSync(join(tmpDir, ".apex-manager", "workers", "T1", "meta.json"), JSON.stringify({
+      task_id: "T1-gone",
+      window_handle: null,
+      worktree_path: ".apex-manager/worktrees/T1",
+      branch: "apex-mgr/T1",
+      started_at: new Date().toISOString(),
+      agent: "codex",
+      isolation_mode: "git-worktree",
+      launch_verification: { state: "verified" },
+    }, null, 2));
+
+    const { collectWarRoomData, renderWarRoom } = await import("../../src/orch/war-room.js");
+    const data = await collectWarRoomData();
+    const screen = renderWarRoom(data);
+
+    assert.strictEqual(data.workerViews[0]?.taskId, "T1-gone");
+    assert.strictEqual(data.workerViews[0]?.label, "UNKNOWN");
+    assert.ok(screen.includes("UNKNOWN"));
   });
 });

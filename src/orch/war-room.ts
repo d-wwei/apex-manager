@@ -1,6 +1,7 @@
 import { spawnSync } from "child_process";
 import { existsSync, readFileSync, readdirSync, watch, type FSWatcher } from "fs";
-import { basename, join, resolve } from "path";
+import { basename, dirname, join, resolve } from "path";
+import { fileURLToPath } from "url";
 import { readJSON } from "../utils/json.js";
 import { readKernelEvents } from "../utils/events.js";
 import { detectAdapter } from "../worker/terminal.js";
@@ -98,6 +99,26 @@ function shellQuote(value: string): string {
 
 function escapeForAppleScript(value: string): string {
   return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function resolveRepoLocalLauncher(): string {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  while (true) {
+    const launcher = join(dir, "bin", "apex-manager.sh");
+    if (existsSync(launcher)) {
+      return launcher;
+    }
+
+    const parent = dirname(dir);
+    if (parent === dir) {
+      return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "bin", "apex-manager.sh");
+    }
+    dir = parent;
+  }
 }
 
 function fitLine(line: string, width: number): string {
@@ -375,7 +396,7 @@ function createWarRoomWatchers(projectRoot: string, onChange: () => void): () =>
 }
 
 export function moneyComeToEliForegroundCommand(projectRoot: string): string {
-  const launcher = resolve(projectRoot, "bin", "apex-manager.sh");
+  const launcher = resolveRepoLocalLauncher();
   return `cd ${shellQuote(projectRoot)} && ${shellQuote(launcher)} orch Money-Come-To-Eli --foreground`;
 }
 
@@ -449,7 +470,26 @@ export async function collectWarRoomData(): Promise<WarRoomData> {
   let stale = 0;
 
   for (const worker of workers) {
-    const health = await checkWorkerHealth(worker.meta.task_id);
+    let health: WorkerHealth;
+    let classified: { label: string; detail: string };
+    try {
+      health = await checkWorkerHealth(worker.meta.task_id);
+      classified = classifyWorkerLabel(worker, health);
+    } catch (error) {
+      health = {
+        alive: false,
+        starting: false,
+        stale: false,
+        completed: false,
+        crashed: false,
+        exitedWithoutResult: false,
+      };
+      classified = {
+        label: "UNKNOWN",
+        detail: `health unavailable: ${errorMessage(error)}`,
+      };
+    }
+
     if (health.alive) alive += 1;
     if (health.starting) starting += 1;
     if (health.completed) completed += 1;
@@ -457,7 +497,6 @@ export async function collectWarRoomData(): Promise<WarRoomData> {
     if (health.exitedWithoutResult) exitedWithoutResult += 1;
     if (health.stale) stale += 1;
 
-    const classified = classifyWorkerLabel(worker, health);
     workerViewsUnbounded.push({
       taskId: worker.meta.task_id,
       title: taskTitles.get(worker.meta.task_id) ?? "(untitled task)",
@@ -570,6 +609,20 @@ export function renderWarRoom(data: WarRoomData, viewport?: { width?: number }):
   return lines.join("\n");
 }
 
+function renderWarRoomError(error: unknown, viewport?: { width?: number }): string {
+  const width = Math.max(60, viewport?.width ?? 100);
+  const lines = [
+    rule(width, "="),
+    `MONEY-COME-TO-ELI // WAR ROOM    Refresh temporarily failed    ${formatTimestamp(new Date().toISOString())}`,
+    rule(width),
+    `Error: ${errorMessage(error)}`,
+    "",
+    "The dashboard is still running. Waiting for the next file event or polling refresh.",
+    "Exit: q / Ctrl-C    Manual refresh: r",
+  ];
+  return lines.map((line) => fitLine(line, width)).join("\n");
+}
+
 export async function runMoneyComeToEli(args: string[]): Promise<void> {
   const once = args.includes("--once");
   const foreground = args.includes("--foreground");
@@ -648,6 +701,10 @@ export async function runMoneyComeToEli(args: string[]): Promise<void> {
     try {
       const data = await collectWarRoomData();
       const screen = renderWarRoom(data, { width: stdout.columns });
+      stdout.write("\u001b[H\u001b[2J");
+      stdout.write(`${screen}\n`);
+    } catch (error) {
+      const screen = renderWarRoomError(error, { width: stdout.columns });
       stdout.write("\u001b[H\u001b[2J");
       stdout.write(`${screen}\n`);
     } finally {
