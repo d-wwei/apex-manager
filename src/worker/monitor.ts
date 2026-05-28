@@ -6,6 +6,7 @@ import { spawnSync } from "child_process";
 import { existsSync, readdirSync } from "fs";
 import { join } from "path";
 import { readJSON } from "../utils/json.js";
+import { redactSecrets } from "../utils/redact.js";
 import { adapterForHandle } from "./terminal.js";
 import type { WindowHandle } from "./terminal.js";
 
@@ -41,12 +42,22 @@ export interface WorkerMeta {
   execution_mode?: "persistent" | "one-shot";
   isolation_mode?: "git-worktree" | "project-root";
   launch_verification?: {
-    state: "pending" | "verified" | "failed";
+    state: "pending" | "unverified" | "verified" | "failed";
     checked_at?: string;
     action_signal?: "task_claimed" | "status_updated" | "result_written";
     screen_summary?: string;
     client_mapped?: boolean | null;
     note?: string;
+  };
+  main_repo_baseline_status?: string;
+  isolation_violation?: {
+    detected_at: string;
+    baseline_status: string;
+    current_status: string;
+  };
+  orphaned_task_done?: {
+    detected_at: string;
+    note: string;
   };
 }
 
@@ -58,6 +69,8 @@ export interface WorkerHealth {
   crashed: boolean;
   /** Terminal exited without writing result.json (one-shot agents or silent failures). */
   exitedWithoutResult: boolean;
+  /** Task store says done even though this worker did not write result.json. */
+  completedOrphaned: boolean;
   screenTail?: string;
 }
 
@@ -129,6 +142,7 @@ export async function checkWorkerHealth(taskId: string): Promise<WorkerHealth> {
   const result = await readJSON<WorkerResult | null>(join(dir, "result.json"), null);
 
   const completed = result !== null;
+  const completedOrphaned = !completed && meta.orphaned_task_done !== undefined;
   const startedAtMs = new Date(meta.started_at).getTime();
   const withinStartupGrace = Number.isFinite(startedAtMs) && (Date.now() - startedAtMs) < STARTUP_GRACE_MS;
   const starting = !completed && !status?.last_activity && withinStartupGrace;
@@ -141,7 +155,7 @@ export async function checkWorkerHealth(taskId: string): Promise<WorkerHealth> {
   if (meta.window_handle) {
     const adapter = adapterForHandle(meta.window_handle as WindowHandle);
     try {
-      screenTail = await adapter.readScreen(meta.window_handle as WindowHandle, 5);
+      screenTail = redactSecrets(await adapter.readScreen(meta.window_handle as WindowHandle, 5));
     } catch {
       // Best-effort only; keep going so a dead surface still reports crash state.
     }
@@ -168,12 +182,12 @@ export async function checkWorkerHealth(taskId: string): Promise<WorkerHealth> {
   // Crashed vs exited-without-result: both have no terminal and no result.
   // Distinguish by execution_mode: one-shot agents are expected to exit.
   const hadProcess = meta.pid !== undefined || meta.window_handle !== null;
-  const processGone = hadProcess && !alive && !completed && !starting;
+  const processGone = hadProcess && !alive && !completed && !completedOrphaned && !starting;
   const isOneShot = meta.execution_mode === "one-shot";
   const crashed = processGone && !isOneShot;
   const exitedWithoutResult = processGone && isOneShot;
 
-  return { alive, starting, stale, completed, crashed, exitedWithoutResult, screenTail };
+  return { alive, starting, stale, completed, crashed, exitedWithoutResult, completedOrphaned, screenTail };
 }
 
 // ── getMonitorReport ───────────────────────────────────────────────
@@ -190,6 +204,8 @@ export async function getMonitorReport(): Promise<string> {
 
     if (health.completed) {
       label = `completed (${w.result?.verdict ?? "unknown"})`;
+    } else if (health.completedOrphaned) {
+      label = "completed_orphaned";
     } else if (health.starting) {
       label = "STARTING";
     } else if (health.crashed) {
@@ -209,7 +225,7 @@ export async function getMonitorReport(): Promise<string> {
     lines.push(`[${w.meta.task_id}] ${label}  stage: ${stage}  progress: ${progress}`);
 
     if (health.screenTail) {
-      const tail = health.screenTail.split("\n").slice(-5).map((l) => `  | ${l}`).join("\n");
+      const tail = redactSecrets(health.screenTail).split("\n").slice(-5).map((l) => `  | ${l}`).join("\n");
       lines.push(tail);
     }
   }

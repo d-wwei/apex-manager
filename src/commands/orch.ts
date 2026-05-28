@@ -282,7 +282,15 @@ export async function cmdOrch(args: string[]): Promise<void> {
     case "money-come-to-eli":
       await runMoneyComeToEli(rest);
       break;
-    default:
+    case "help":
+    case "--help":
+    case "-h":
+    case undefined:
       console.log("Usage: apex-manager orch <start|stop|status|events|snapshot> [--force]");
+      break;
+    default:
+      console.error(`Unknown orch subcommand: ${sub}`);
+      console.error("Usage: apex-manager orch <start|stop|status|events|snapshot> [--force]");
+      process.exit(1);
   }
 }

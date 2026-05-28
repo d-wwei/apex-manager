@@ -1,4 +1,6 @@
 import { spawnSync } from "child_process";
+import { createHash } from "crypto";
+import { basename } from "path";
 
 // --- WindowHandle ---
 
@@ -171,6 +173,8 @@ export class CmuxAdapter implements TerminalAdapter {
 // --- TmuxAdapter ---
 
 const TMUX_SESSION_PREFIX = "apex-worker";
+const TMUX_SHARED_SESSION_PREFIX = "apex-workers";
+const TMUX_WORKER_PANE_TITLE_PREFIX = "apex-worker:";
 
 export interface TmuxClientInfo {
   tty: string;
@@ -208,6 +212,12 @@ export class TmuxAdapter implements TerminalAdapter {
   private makeDetachedSessionName(name: string): string {
     const suffix = Math.random().toString(36).slice(2, 8);
     return `${TMUX_SESSION_PREFIX}-${this.sanitizeSessionFragment(name)}-${suffix}`;
+  }
+
+  private makeSharedSessionName(): string {
+    const cwd = process.cwd();
+    const suffix = createHash("sha1").update(cwd).digest("hex").slice(0, 8);
+    return `${TMUX_SHARED_SESSION_PREFIX}-${this.sanitizeSessionFragment(basename(cwd))}-${suffix}`;
   }
 
   private submit(handle: WindowHandle): void {
@@ -257,47 +267,96 @@ export class TmuxAdapter implements TerminalAdapter {
     }
   }
 
-  async createWindow(name: string, command: string): Promise<WindowHandle> {
-    const insideTmux = !!process.env.TMUX;
-
-    let result;
-    if (insideTmux) {
-      // Inside tmux: split current window — Worker appears as a visible pane
-      // next to the Plan Agent. Use -h for horizontal split, -d to not switch focus.
-      result = run("tmux", [
-        "split-window", "-h", "-d",
-        "-P", "-F", "#{pane_id}",
-        command,
-      ]);
-      if (result.ok) {
-        // Rebalance all panes evenly after each split
-        run("tmux", ["select-layout", "tiled"]);
-      }
-    } else {
-      // Outside tmux: each worker gets its own detached session and viewer.
-      const sessionName = this.makeDetachedSessionName(name);
-      result = run("tmux", ["new-session", "-d", "-s", sessionName, "-n", name, "-P", "-F", "#{window_id}", command]);
-      if (result.ok) {
-        this.openViewer(sessionName);
-      }
-      if (!result.ok) {
-        throw new Error(`tmux create session failed: ${result.stderr}`);
-      }
-      const target = result.stdout;
-      return { id: target, name, adapter: "tmux", session: sessionName };
+  private currentTmuxContext(): { session: string; windowId: string; paneId: string } {
+    const result = run("tmux", ["display-message", "-p", "#{session_name}\t#{window_id}\t#{pane_id}"]);
+    if (!result.ok) {
+      throw new Error(`tmux display-message failed: ${result.stderr}`);
     }
+    const [session = "", windowId = "", paneId = ""] = result.stdout.split("\t");
+    return { session, windowId, paneId };
+  }
 
+  private listPanes(target: string): Array<{ paneId: string; title: string }> {
+    const result = run("tmux", ["list-panes", "-t", target, "-F", "#{pane_id}\t#{pane_title}"]);
+    if (!result.ok) return [];
+    return result.stdout
+      .split("\n")
+      .filter((line) => line.trim().length > 0)
+      .map((line) => {
+        const [paneId = "", title = ""] = line.split("\t");
+        return { paneId, title };
+      });
+  }
+
+  private lastWorkerPane(target: string): string | null {
+    const panes = this.listPanes(target);
+    for (let i = panes.length - 1; i >= 0; i--) {
+      if (panes[i].title.startsWith(TMUX_WORKER_PANE_TITLE_PREFIX)) {
+        return panes[i].paneId;
+      }
+    }
+    return null;
+  }
+
+  private markWorkerPane(paneId: string, name: string): void {
+    run("tmux", ["select-pane", "-t", paneId, "-T", `${TMUX_WORKER_PANE_TITLE_PREFIX}${name}`]);
+  }
+
+  private arrangeTeamLayout(target: string): void {
+    run("tmux", ["select-layout", "-t", target, "main-vertical"]);
+  }
+
+  private createPaneInTeamWindow(targetWindow: string, planPane: string, name: string, command: string): WindowHandle {
+    const existingWorkerPane = this.lastWorkerPane(targetWindow);
+    const splitTarget = existingWorkerPane ?? planPane;
+    const splitDirection = existingWorkerPane ? "-v" : "-h";
+    const result = run("tmux", [
+      "split-window", splitDirection, "-d",
+      "-t", splitTarget,
+      "-P", "-F", "#{pane_id}",
+      command,
+    ]);
     if (!result.ok) {
       throw new Error(`tmux create pane/window failed: ${result.stderr}`);
     }
-    const target = result.stdout;
-    const sessionResult = run("tmux", ["display-message", "-p", "-t", target, "#{session_name}"]);
+    const paneId = result.stdout;
+    this.markWorkerPane(paneId, name);
+    this.arrangeTeamLayout(targetWindow);
+    const sessionResult = run("tmux", ["display-message", "-p", "-t", paneId, "#{session_name}"]);
     return {
-      id: target,
+      id: paneId,
       name,
       adapter: "tmux",
       session: sessionResult.ok ? sessionResult.stdout : undefined,
     };
+  }
+
+  private ensureSharedSession(sessionName: string): boolean {
+    const exists = run("tmux", ["has-session", "-t", sessionName]);
+    if (exists.ok) return false;
+    const create = run("tmux", ["new-session", "-d", "-s", sessionName, "-n", "workers"]);
+    if (!create.ok) {
+      throw new Error(`tmux create shared session failed: ${create.stderr}`);
+    }
+    return true;
+  }
+
+  async createWindow(name: string, command: string): Promise<WindowHandle> {
+    const insideTmux = !!process.env.TMUX;
+
+    if (insideTmux) {
+      // Inside tmux: keep the Plan Agent as the left/main pane and stack workers on the right.
+      const context = this.currentTmuxContext();
+      return this.createPaneInTeamWindow(context.windowId, context.paneId, name, command);
+    }
+
+    // Outside tmux: reuse one project-scoped tmux session/window instead of opening one terminal per worker.
+    const sessionName = this.makeSharedSessionName();
+    const created = this.ensureSharedSession(sessionName);
+    if (created) {
+        this.openViewer(sessionName);
+    }
+    return this.createPaneInTeamWindow(`${sessionName}:0`, `${sessionName}:0.0`, name, command);
   }
 
   async send(handle: WindowHandle, text: string): Promise<void> {

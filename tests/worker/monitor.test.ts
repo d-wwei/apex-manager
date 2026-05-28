@@ -230,11 +230,11 @@ describe("checkWorkerHealth", () => {
     await assert.rejects(() => checkWorkerHealth("NONEXISTENT"));
   });
 
-  it("uses the recorded cmux adapter to collect screen tail diagnostics", async () => {
+  it("uses the recorded cmux adapter to collect redacted screen tail diagnostics", async () => {
     installFakeCmux(`#!/bin/sh
 case "$1" in
   read-screen)
-    echo "last visible cmux line"
+    echo "last visible cmux line OPENAI_API_KEY=sk-testsecret123456789"
     exit 0
     ;;
   validate-surface)
@@ -257,7 +257,7 @@ esac
 
     const health = await checkWorkerHealth("T1");
     assert.strictEqual(health.crashed, true);
-    assert.strictEqual(health.screenTail, "last visible cmux line");
+    assert.strictEqual(health.screenTail, "last visible cmux line OPENAI_API_KEY=[REDACTED]");
   });
 });
 

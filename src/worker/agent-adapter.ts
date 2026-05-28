@@ -57,6 +57,15 @@ export function buildEnvPrefix(skip?: string[]): string {
   return parts.length > 0 ? parts.join(" ") + " " : "";
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+function autoApprovalAllowed(): boolean {
+  return process.env.APEX_MANAGER_ALLOW_AUTO_APPROVAL === "1" ||
+    process.env.APEX_MANAGER_ALLOW_AUTO_APPROVAL === "true";
+}
+
 // ── Supporting types ─────────────────────────────────────────────────
 
 export type ProtocolInjectionMethod =
@@ -212,16 +221,17 @@ export function buildAdapterFromEntry(name: string, entry: AgentEntry): AgentAda
       autoApprovalFlag: autoApproval || undefined,
     },
     buildStartCommand(opts: StartOpts): string {
-      const model = opts.model ? ` --model "${opts.model}"` : "";
+      const command = shellQuote(entry.command);
+      const model = opts.model ? ` --model ${shellQuote(opts.model)}` : "";
       const env = envForward ? buildEnvPrefix(skipProxy ? ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"] : []) : "";
-      const argsStr = args.length > 0 ? " " + args.join(" ") : "";
-      const approvalStr = autoApproval ? ` ${autoApproval}` : "";
+      const argsStr = args.length > 0 ? " " + args.map(shellQuote).join(" ") : "";
+      const approvalStr = autoApproval && autoApprovalAllowed() ? ` ${shellQuote(autoApproval)}` : "";
 
       if (protocol === "system-prompt-file") {
-        return `cd "${opts.worktreePath}" && ${env}${entry.command}${model}${argsStr} ${protocolFlag} "${opts.protocolPath}"${approvalStr}`;
+        return `cd ${shellQuote(opts.worktreePath)} && ${env}${command}${model}${argsStr} ${shellQuote(protocolFlag)} ${shellQuote(opts.protocolPath)}${approvalStr}`;
       }
       // post-create-send or none: just start the agent
-      return `cd "${opts.worktreePath}" && ${env}${entry.command}${model}${argsStr}${approvalStr}`;
+      return `cd ${shellQuote(opts.worktreePath)} && ${env}${command}${model}${argsStr}${approvalStr}`;
     },
   };
 }

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .apex-manager/
+.DS_Store
 *.js
 *.d.ts
 *.js.map

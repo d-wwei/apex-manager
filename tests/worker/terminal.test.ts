@@ -172,18 +172,32 @@ describe("TmuxAdapter detached sessions", () => {
 echo "tmux:$@" >> "$TMUX_LOG"
 case "$1" in
   new-session)
-    echo "@42"
+    exit 0
+    ;;
+  has-session)
+    exit 1
+    ;;
+  split-window)
+    echo "%42"
     exit 0
     ;;
   display-message)
-    echo "apex-worker-t1-auth-abc123\t@42\tT1-auth"
+    if [ "$4" = "%42" ]; then
+      echo "apex-workers-apex-manager-abc123"
+    else
+      echo "apex-worker-t1-auth-abc123\t@42\tT1-auth"
+    fi
+    exit 0
+    ;;
+  list-panes)
+    echo "%1\tzsh"
     exit 0
     ;;
   list-clients)
     echo "/dev/ttys001\tapex-worker-t1-auth-abc123\t@42\tT1-auth"
     exit 0
     ;;
-  kill-session|kill-window|kill-pane|list-panes|list-windows|send-keys|capture-pane|has-session|select-layout)
+  kill-session|kill-window|kill-pane|list-windows|send-keys|capture-pane|select-layout|select-pane)
     exit 0
     ;;
   *)
@@ -214,16 +228,62 @@ exit 0
     rmSync(tmpPathDir, { recursive: true, force: true });
   });
 
-  it("creates a dedicated tmux session when launched outside tmux", async () => {
+  it("creates a shared tmux worker session when launched outside tmux", async () => {
     const adapter = new TmuxAdapter();
     const handle = await adapter.createWindow("T1-auth", "echo boot");
 
-    assert.strictEqual(handle.id, "@42");
-    assert.ok(handle.session?.startsWith("apex-worker-t1-auth-"));
+    assert.strictEqual(handle.id, "%42");
+    assert.ok(handle.session?.startsWith("apex-workers-"));
 
     const log = readFileSync(logPath, "utf-8");
-    assert.ok(log.includes("tmux:new-session -d -s apex-worker-t1-auth-"));
+    assert.ok(log.includes("tmux:new-session -d -s apex-workers-"));
+    assert.ok(log.includes("tmux:split-window -h -d -t apex-workers-"));
+    assert.ok(log.includes("tmux:select-layout -t apex-workers-"));
     assert.ok(log.includes("osascript:-e"));
+  });
+
+  it("inside tmux keeps plan pane as main column and stacks workers on the right", async () => {
+    const tmuxScript = `#!/bin/sh
+echo "tmux:$@" >> "$TMUX_LOG"
+case "$1" in
+  display-message)
+    if [ "$2" = "-p" ] && [ "$#" = "3" ]; then
+      echo "plan-session\t@9\t%1"
+    elif [ "$4" = "%2" ]; then
+      echo "plan-session"
+    else
+      echo "plan-session\t@9\tmain"
+    fi
+    exit 0
+    ;;
+  list-panes)
+    echo "%1\tzsh"
+    exit 0
+    ;;
+  split-window)
+    echo "%2"
+    exit 0
+    ;;
+  select-pane|select-layout)
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`;
+    writeFileSync(join(tmpPathDir, "tmux"), tmuxScript);
+    chmodSync(join(tmpPathDir, "tmux"), 0o755);
+    process.env.TMUX = "/tmp/tmux-test";
+
+    const adapter = new TmuxAdapter();
+    const handle = await adapter.createWindow("T1-auth", "echo boot");
+
+    assert.strictEqual(handle.id, "%2");
+    const log = readFileSync(logPath, "utf-8");
+    assert.ok(log.includes("tmux:split-window -h -d -t %1 -P -F #{pane_id} echo boot"));
+    assert.ok(log.includes("tmux:select-pane -t %2 -T apex-worker:T1-auth"));
+    assert.ok(log.includes("tmux:select-layout -t @9 main-vertical"));
   });
 
   it("send() submits text and Enter as separate tmux commands", async () => {

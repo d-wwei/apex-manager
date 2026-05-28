@@ -9,6 +9,7 @@ import { adapterForHandle, detectAdapter } from "./terminal.js";
 import { loadAgentsConfig } from "./agent-adapter.js";
 import { interruptKeys } from "./interrupt.js";
 import { isWorkerIdleScreen, waitForWorkerIdle } from "./idle.js";
+import { redactSecrets } from "../utils/redact.js";
 
 export interface SendStructuredMessageOptions {
   from: string;
@@ -114,7 +115,7 @@ async function recordMessageEvent(
   await recordKernelEvent({
     type,
     timestamp: new Date().toISOString(),
-    message: cloneMessage(message),
+    message: { ...cloneMessage(message), body: redactSecrets(message.body) },
     ...extra,
   });
 }

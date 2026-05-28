@@ -1,5 +1,6 @@
 import { ackMessage, getMessage, listMessages, sendStructuredMessage } from "../worker/messages.js";
 import type { MessageRecord } from "../types/message.js";
+import { redactSecrets } from "../utils/redact.js";
 
 function flagValue(args: string[], flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -14,7 +15,7 @@ function formatMessage(message: MessageRecord): string {
   return [
     `${message.id}  ${message.kind}  ${message.delivery_status}  ${message.from} -> ${message.to}`,
     `  priority: ${message.priority}  ack: ${message.ack_required ? "required" : "none"}`,
-    `  body: ${message.body}`,
+    `  body: ${redactSecrets(message.body)}`,
   ].join("\n");
 }
 

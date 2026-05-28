@@ -40,7 +40,7 @@ function summarizeSmokeScreen(screen: string): string {
   return line ?? "(screen empty)";
 }
 
-async function detectLaunchActionSignal(
+export async function detectLaunchActionSignal(
   projectRoot: string,
   workerId: string,
   actionTaskId?: string | null,
@@ -63,11 +63,39 @@ async function detectLaunchActionSignal(
     return null;
   }
 
-  if (task.status === "in_progress" || task.status === "done" || task.status === "blocked" || task.claimed_by === actionTaskId) {
+  if (
+    task.claimed_by === actionTaskId ||
+    task.completed_by === actionTaskId ||
+    (task.blocked_by ?? []).includes(actionTaskId)
+  ) {
     return "task_claimed";
   }
 
   return null;
+}
+
+export async function assertLaunchSurfaceAlive(
+  taskId: string,
+  terminal: TerminalAdapter,
+  handle: WindowHandle,
+): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) {
+      await sleep(250);
+    }
+    try {
+      const alive = await terminal.isAlive(handle);
+      if (!alive) {
+        throw new Error("terminal surface is no longer alive");
+      }
+      await terminal.readScreen(handle, 1);
+      return;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`spawn_failed_terminal_surface_missing: ${taskId}: ${String(lastError)}`);
 }
 
 export async function verifyWorkerLaunch(
@@ -82,13 +110,21 @@ export async function verifyWorkerLaunch(
   let latestScreen = "(screen unavailable)";
   let latestClientMapped: boolean | null = null;
   let latestClientNote = "";
+  let terminalReadable = false;
+  let terminalAlive = false;
 
   while (Date.now() < deadline) {
     try {
       const screen = await terminal.readScreen(handle, 12);
       latestScreen = summarizeSmokeScreen(screen).slice(0, 140);
+      terminalReadable = true;
     } catch {
       latestScreen = "(screen unavailable)";
+    }
+    try {
+      terminalAlive = await terminal.isAlive(handle);
+    } catch {
+      terminalAlive = false;
     }
 
     const tmuxInfo = inspectTmuxHandle(handle);
@@ -114,8 +150,9 @@ export async function verifyWorkerLaunch(
     await sleep(1_000);
   }
 
+  const hasTerminalActivity = terminalReadable || terminalAlive || latestClientMapped === true;
   return {
-    state: "failed",
+    state: hasTerminalActivity ? "unverified" : "failed",
     checked_at: new Date().toISOString(),
     screen_summary: latestScreen,
     client_mapped: latestClientMapped,

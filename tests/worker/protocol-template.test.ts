@@ -127,6 +127,16 @@ describe("buildWorkerProtocol", () => {
     assert.ok(md.includes("/home/user/myproject/.apex-manager/workers/T3/status.json"));
     assert.ok(!md.includes("/home/user/myproject/.apex-manager/worktrees/T3/.apex-manager/workers"));
   });
+
+  it("shell-quotes generated bash paths with spaces and single quotes", () => {
+    const projectRoot = "/tmp/apex manager/user's repo";
+    const md = buildWorkerProtocol(makeOpts({ projectRoot }));
+
+    assert.ok(md.includes("cd '/tmp/apex manager/user'\\''s repo' && apex-manager task claim T3 --by T3"));
+    assert.ok(md.includes("cat > '/tmp/apex manager/user'\\''s repo/.apex-manager/workers/T3/status.json'"));
+    assert.ok(md.includes("test -f '/tmp/apex manager/user'\\''s repo/.apex-manager/workers/T3/directive.json'"));
+    assert.ok(!md.includes(`cd ${projectRoot} &&`));
+  });
 });
 
 describe("buildWorkerProtocol — English (lang=en)", () => {
@@ -197,20 +207,20 @@ describe("agentStartCommand", () => {
     assert.ok(cmd.includes(worktree));
   });
 
-  it("returns codex command with interactive --full-auto", async () => {
+  it("returns codex command without default --full-auto", async () => {
     const cmd = await agentStartCommand("codex", worktree);
     assert.ok(cmd.includes("codex"));
-    assert.ok(cmd.includes("--full-auto"));
-    assert.ok(cmd.includes("-a never"));
-    assert.ok(cmd.includes("-s danger-full-access"));
+    assert.ok(!cmd.includes("--full-auto"));
+    assert.ok(cmd.includes("'-a' 'never'"));
+    assert.ok(cmd.includes("'-s' 'danger-full-access'"));
     assert.ok(!cmd.includes("exec"), "should not use one-shot exec mode");
     assert.ok(cmd.includes(worktree));
   });
 
-  it("returns gemini command with interactive --yolo", async () => {
+  it("returns gemini command without default --yolo", async () => {
     const cmd = await agentStartCommand("gemini", worktree);
     assert.ok(cmd.includes("gemini"));
-    assert.ok(cmd.includes("--yolo"));
+    assert.ok(!cmd.includes("--yolo"));
     assert.ok(!cmd.includes("-p"), "should not use one-shot -p flag");
     assert.ok(cmd.includes(worktree));
   });

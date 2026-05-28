@@ -6,10 +6,22 @@
   "bin": {
     "apex-manager": "bin/apex-manager.sh"
   },
+  "files": [
+    "bin/",
+    "src/",
+    "skills/Money-Come-To-Eli/",
+    "docs/reference/",
+    "README.md",
+    "README.zh.md",
+    "SKILL.md",
+    "CHANGELOG.md",
+    "install.sh"
+  ],
   "scripts": {
     "dev": "npx tsx src/cli.ts",
     "test": "node --import tsx --test tests/**/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run typecheck && npm test"
   },
   "dependencies": {
     "tsx": "^4.19.0"

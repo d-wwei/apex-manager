@@ -10,6 +10,8 @@ import {
   extractUsageFromBody,
   readRateLimit,
   readCostSummary,
+  startProxy,
+  stopProxy,
   type RateLimitInfo,
   type CostEntry,
 } from "../../src/worker/proxy.js";
@@ -26,6 +28,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  delete process.env.APEX_MANAGER_PROXY_TOKEN;
   process.chdir(originalCwd);
   rmSync(testDir, { recursive: true, force: true });
 });
@@ -268,5 +271,22 @@ describe("readCostSummary", () => {
     const summary = await readCostSummary();
     assert.strictEqual(summary.total_requests, 2);
     assert.ok(Math.abs(summary.by_task["T1"].total_cost_usd - 0.0315) < 0.0001);
+  });
+});
+
+describe("startProxy", () => {
+  it("binds locally and rejects requests without the configured bearer token", async () => {
+    process.env.APEX_MANAGER_PROXY_TOKEN = "test-token";
+    const port = await startProxy(0);
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/v1/messages`, { method: "POST" });
+      assert.strictEqual(res.status, 401);
+
+      const portInfo = JSON.parse(readFileSync(".apex-manager/proxy-port", "utf-8"));
+      assert.strictEqual(portInfo.host, "127.0.0.1");
+      assert.strictEqual(portInfo.port, port);
+    } finally {
+      await stopProxy();
+    }
   });
 });

@@ -1,5 +1,5 @@
 import { existsSync } from "fs";
-import { resolve } from "path";
+import { isAbsolute, relative, resolve } from "path";
 import { readJSON, writeJSON } from "../utils/json.js";
 import { recordKernelEvent } from "../utils/events.js";
 import { apexPath, ensureProjectLayout, DEFAULT_ARTIFACT_STORE, DEFAULT_TASK_STORE } from "../utils/project-state.js";
@@ -43,6 +43,55 @@ function formatArtifact(artifact: ArtifactRecord): string {
   ].join("\n");
 }
 
+function isInside(path: string, base: string): boolean {
+  const rel = relative(resolve(base), resolve(path));
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+async function artifactAllowedRoots(taskId: string, by: string): Promise<string[]> {
+  const projectRoot = process.cwd();
+  const roots = [projectRoot];
+  const workerMeta = await readJSON<{ worktree_path?: string } | null>(apexPath("workers", by, "meta.json"), null);
+  if (workerMeta?.worktree_path) {
+    roots.push(resolve(projectRoot, workerMeta.worktree_path));
+  }
+  if (by !== taskId) {
+    const taskWorkerMeta = await readJSON<{ worktree_path?: string } | null>(apexPath("workers", taskId, "meta.json"), null);
+    if (taskWorkerMeta?.worktree_path) {
+      roots.push(resolve(projectRoot, taskWorkerMeta.worktree_path));
+    }
+  }
+  return [...new Set(roots)];
+}
+
+async function resolveArtifactPath(taskId: string, by: string, path: string): Promise<{ absolutePath: string; tried: string[] }> {
+  const cwdCandidate = resolve(process.cwd(), path);
+  const projectRoot = process.cwd();
+  const candidates: string[] = [];
+
+  const workerMeta = await readJSON<{ worktree_path?: string } | null>(
+    apexPath("workers", by, "meta.json"),
+    null,
+  );
+  if (workerMeta?.worktree_path) {
+    candidates.push(resolve(projectRoot, workerMeta.worktree_path, path));
+  }
+
+  const taskWorkerMeta = by === taskId
+    ? workerMeta
+    : await readJSON<{ worktree_path?: string } | null>(apexPath("workers", taskId, "meta.json"), null);
+  if (taskWorkerMeta?.worktree_path) {
+    candidates.push(resolve(projectRoot, taskWorkerMeta.worktree_path, path));
+  }
+
+  candidates.push(cwdCandidate);
+  candidates.push(resolve(projectRoot, path));
+
+  const uniqueCandidates = [...new Set(candidates)];
+  const existing = uniqueCandidates.find((candidate) => existsSync(candidate));
+  return { absolutePath: existing ?? cwdCandidate, tried: uniqueCandidates };
+}
+
 async function cmdSubmit(args: string[]): Promise<void> {
   ensureProjectLayout();
 
@@ -64,9 +113,23 @@ async function cmdSubmit(args: string[]): Promise<void> {
     process.exit(1);
   }
 
-  const absolutePath = resolve(process.cwd(), path);
+  const { absolutePath, tried } = await resolveArtifactPath(taskId, by, path);
   if (!existsSync(absolutePath)) {
     console.error(`Artifact path does not exist: ${path}`);
+    console.error("Tried:");
+    for (const candidate of tried) {
+      console.error(`  ${candidate}`);
+    }
+    console.error("Use an absolute path or run artifact submit from the directory containing the artifact.");
+    process.exit(1);
+  }
+  const allowedRoots = await artifactAllowedRoots(taskId, by);
+  if (!allowedRoots.some((root) => isInside(absolutePath, root))) {
+    console.error(`Artifact path is outside the project/worktree boundary: ${path}`);
+    console.error("Allowed roots:");
+    for (const root of allowedRoots) {
+      console.error(`  ${root}`);
+    }
     process.exit(1);
   }
 

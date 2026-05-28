@@ -58,6 +58,7 @@ const DEFAULT_PRICING = PRICING["sonnet-4"];
 
 const THROTTLE_THRESHOLD = 0.90;
 const UPSTREAM = "https://api.anthropic.com";
+const PROXY_HOST = "127.0.0.1";
 const AM_DIR = ".apex-manager";
 const RATE_LIMIT_FILE = `${AM_DIR}/rate-limit.json`;
 const COST_LOG_FILE = `${AM_DIR}/cost-log.jsonl`;
@@ -164,7 +165,7 @@ async function findAvailablePort(start: number, end: number): Promise<number> {
     const available = await new Promise<boolean>((resolve) => {
       const test = http.createServer();
       test.once("error", () => resolve(false));
-      test.listen(port, () => {
+      test.listen(port, PROXY_HOST, () => {
         test.close(() => resolve(true));
       });
     });
@@ -182,6 +183,15 @@ export async function startProxy(port?: number): Promise<number> {
 
   proxyServer = http.createServer(async (req, res) => {
     try {
+      const expectedToken = process.env.APEX_MANAGER_PROXY_TOKEN;
+      if (expectedToken) {
+        const auth = req.headers.authorization;
+        if (auth !== `Bearer ${expectedToken}`) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "unauthorized" }));
+          return;
+        }
+      }
       const url = new URL(req.url ?? "/", `http://localhost:${resolvedPort}`);
       const upstreamUrl = `${UPSTREAM}${url.pathname}${url.search}`;
 
@@ -264,11 +274,13 @@ export async function startProxy(port?: number): Promise<number> {
 
   await new Promise<void>((resolve, reject) => {
     proxyServer!.once("error", reject);
-    proxyServer!.listen(resolvedPort, () => resolve());
+    proxyServer!.listen(resolvedPort, PROXY_HOST, () => resolve());
   });
 
-  await writeJSON(PORT_FILE, { port: resolvedPort, pid: process.pid });
-  return resolvedPort;
+  const address = proxyServer.address();
+  const actualPort = typeof address === "object" && address ? address.port : resolvedPort;
+  await writeJSON(PORT_FILE, { host: PROXY_HOST, port: actualPort, pid: process.pid });
+  return actualPort;
 }
 
 export async function stopProxy(): Promise<void> {

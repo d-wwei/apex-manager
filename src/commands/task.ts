@@ -1,10 +1,12 @@
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, renameSync } from "fs";
 import { join } from "path";
 import { readJSON, writeJSON } from "../utils/json.js";
 import type { Task, TaskStatus, TaskStore } from "../types/task.js";
 import { ALLOWED_TRANSITIONS } from "../types/task.js";
 import { recordKernelEvent } from "../utils/events.js";
 import { ensureProjectLayout } from "../utils/project-state.js";
+import { adapterForHandle } from "../worker/terminal.js";
+import type { WorkerMeta } from "../worker/monitor.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -297,6 +299,10 @@ async function cmdComplete(args: string[]): Promise<void> {
     console.error(`Cannot complete ${taskId} from status '${task.status}'`);
     process.exit(1);
   }
+  if (task.claimed_by && by !== task.claimed_by) {
+    console.error(`Cannot complete ${taskId}: --by must match claimed worker '${task.claimed_by}'`);
+    process.exit(1);
+  }
 
   task.previous_status = task.status;
   task.status = "done";
@@ -358,6 +364,104 @@ async function cmdBlock(args: string[]): Promise<void> {
   console.log(`${taskId} blocked`);
 }
 
+async function archiveWorkerForRetry(taskId: string, attempt: number): Promise<string | null> {
+  const workerDir = join(projectRoot(), ".apex-manager", "workers", taskId);
+  if (!existsSync(workerDir)) return null;
+
+  const metaPath = join(workerDir, "meta.json");
+  if (existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(readFileSync(metaPath, "utf-8")) as WorkerMeta;
+      if (meta.window_handle) {
+        try {
+          await adapterForHandle(meta.window_handle).close(meta.window_handle);
+        } catch {
+          // Terminal may already be gone; archival still makes retry schedulable.
+        }
+      }
+    } catch {
+      // Preserve the worker dir even if meta is malformed.
+    }
+  }
+
+  const archiveRoot = join(projectRoot(), ".apex-manager", "workers-archive");
+  mkdirSync(archiveRoot, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const archivePath = join(archiveRoot, `${taskId}-attempt-${attempt}-${stamp}`);
+  renameSync(workerDir, archivePath);
+  return archivePath;
+}
+
+async function cmdRetry(args: string[]): Promise<void> {
+  const taskId = args[0];
+  if (!taskId) {
+    console.error("Usage: apex-manager task retry <task-id> [--agent <agent>] [--protocol <protocol>] [--reason <reason>]");
+    process.exit(1);
+  }
+
+  const store = await loadStore();
+  const task = findTask(store, taskId);
+  if (!task) {
+    console.error(`Task ${taskId} not found`);
+    process.exit(1);
+  }
+  if (task.status === "done") {
+    console.error(`Cannot retry completed task ${taskId}`);
+    process.exit(1);
+  }
+
+  const now = new Date().toISOString();
+  const agent = flagValue(args, "--agent");
+  const protocol = flagValue(args, "--protocol");
+  const reason = flagValue(args, "--reason");
+  task.attempts = task.attempts ?? [];
+  if (task.attempts.length === 0 && task.status !== "open") {
+    task.attempts.push({
+      attempt: task.attempt ?? 1,
+      agent: task.actual_agent ?? task.agent ?? "unknown",
+      worker_id: task.claimed_by ?? task.id,
+      status: task.status === "blocked" ? "blocked" : "failed",
+      started_at: task.claimed_at ?? task.updated_at,
+      completed_at: now,
+      note: reason ?? "retry requested",
+    });
+  }
+
+  const previousAttemptNumber = task.attempt ?? task.attempts.length;
+  const currentAttempt = task.attempts?.[task.attempts.length - 1];
+  if (currentAttempt && !currentAttempt.completed_at) {
+    currentAttempt.status = task.status === "blocked" ? "blocked" : "failed";
+    currentAttempt.completed_at = now;
+    currentAttempt.note = reason ?? currentAttempt.note ?? "retry requested";
+  }
+
+  task.previous_status = task.status;
+  task.status = "open";
+  task.attempt = previousAttemptNumber + 1;
+  if (agent) task.agent = agent;
+  if (protocol) task.protocol = protocol;
+  task.actual_agent = undefined;
+  task.claimed_by = undefined;
+  task.claimed_at = undefined;
+  task.completed_by = undefined;
+  task.completed_at = undefined;
+  task.completion_summary = undefined;
+  task.block_reason = undefined;
+  task.updated_at = now;
+
+  await saveStore(store);
+  const archived = await archiveWorkerForRetry(taskId, previousAttemptNumber);
+  await recordKernelEvent({
+    type: "task.updated",
+    timestamp: task.updated_at,
+    reason: "retry",
+    task: { ...task },
+    ...(archived ? { archived_worker_path: archived } : {}),
+  });
+
+  console.log(`${taskId} retry scheduled (attempt ${task.attempt})${archived ? `; archived previous worker at ${archived}` : ""}`);
+}
+
 // ── Help ─────────────────────────────────────────────────────────────
 
 function printHelp(): void {
@@ -387,6 +491,9 @@ Usage:
 
   apex-manager task block <task-id> --reason <reason> [--by <worker-id>]
     Mark a task blocked with a reason.
+
+  apex-manager task retry <task-id> [--agent <agent>] [--protocol <protocol>] [--reason <reason>]
+    Re-open a non-completed task for another attempt under the same task ID.
 
   apex-manager task update <task-id> [options]
     Update task fields.
@@ -422,6 +529,9 @@ export async function cmdTask(args: string[]): Promise<void> {
       break;
     case "block":
       await cmdBlock(args.slice(1));
+      break;
+    case "retry":
+      await cmdRetry(args.slice(1));
       break;
     case "update":
       await cmdUpdate(args.slice(1));

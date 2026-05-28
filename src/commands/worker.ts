@@ -1,7 +1,7 @@
 import { spawnSync } from "child_process";
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync, readdirSync } from "fs";
 import { join, resolve } from "path";
-import { readJSON, writeJSON } from "../utils/json.js";
+import { readJSON, updateJSON, writeJSON } from "../utils/json.js";
 import { buildWorkerProtocol, agentStartCommand, workerProtocolRelativePath } from "../worker/protocol-builder.js";
 import { adapterForHandle, detectAdapter } from "../worker/terminal.js";
 import type { Task, TaskStore } from "../types/task.js";
@@ -15,12 +15,13 @@ import { formatCostReport, formatRateLimitStatus } from "../worker/cost.js";
 import { readCostSummary, readRateLimit } from "../worker/proxy.js";
 import { loadConfig } from "../utils/config.js";
 import { recordKernelEvent } from "../utils/events.js";
+import { redactSecrets } from "../utils/redact.js";
 import { checkAgent, checkAllAgents } from "../worker/capability-check.js";
 import { loadAgentsConfig, resolveAdapterWithConfig } from "../worker/agent-adapter.js";
 import { interruptKeys } from "../worker/interrupt.js";
 import { sendStructuredMessage } from "../worker/messages.js";
 import { isWorkerIdleScreen, waitForWorkerIdle } from "../worker/idle.js";
-import { buildWorkerKickoffMessage, ensureKickoffSubmitted, verifyWorkerLaunch, waitForKickoffReady } from "../worker/launch.js";
+import { assertLaunchSurfaceAlive, buildWorkerKickoffMessage, ensureKickoffSubmitted, verifyWorkerLaunch, waitForKickoffReady } from "../worker/launch.js";
 
 export { buildWorkerKickoffMessage } from "../worker/launch.js";
 
@@ -72,6 +73,18 @@ function flagValue(args: string[], flag: string): string | undefined {
   return idx >= 0 && args[idx + 1] ? args[idx + 1] : undefined;
 }
 
+function firstPositional(args: string[], valueFlags: Set<string>): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg.startsWith("--")) {
+      if (valueFlags.has(arg)) i++;
+      continue;
+    }
+    return arg;
+  }
+  return undefined;
+}
+
 function findTask(tasks: Task[], taskId: string): Task | undefined {
   return tasks.find((t) => t.id === taskId);
 }
@@ -84,17 +97,80 @@ function workerControlDir(projectRoot: string, taskId: string): string {
   return join(projectRoot, ".apex-manager", "workers", taskId);
 }
 
+function gitStatusExcludingControlPlane(projectRoot: string): string {
+  const status = spawnSync(
+    "git",
+    ["status", "--short", "--", ".", ":(exclude).apex-manager", ":(exclude).apex-manager/**"],
+    { cwd: projectRoot, encoding: "utf-8" },
+  );
+  const diff = spawnSync(
+    "git",
+    ["diff", "--binary", "--", ".", ":(exclude).apex-manager", ":(exclude).apex-manager/**"],
+    { cwd: projectRoot, encoding: "utf-8", maxBuffer: 10 * 1024 * 1024 },
+  );
+  return [
+    status.status === 0 ? status.stdout.trim() : "",
+    diff.status === 0 ? diff.stdout : "",
+  ].join("\n---diff---\n");
+}
+
+async function updateTaskAttemptAfterSpawn(
+  taskId: string,
+  agent: string,
+  startedAt: string,
+): Promise<number> {
+  return updateJSON<TaskStore, number>(".apex-manager/tasks.json", { tasks: [], next_id: 1 }, (store) => {
+    const task = findTask(store.tasks, taskId);
+    if (!task) {
+      throw new Error(`Task ${taskId} not found in .apex-manager/tasks.json`);
+    }
+    const attemptNumber = (task.attempts?.length ?? 0) + 1;
+    task.requested_agent = task.requested_agent ?? task.agent ?? agent;
+    task.actual_agent = agent;
+    task.attempt = attemptNumber;
+    task.attempts = [
+      ...(task.attempts ?? []),
+      {
+        attempt: attemptNumber,
+        agent,
+        worker_id: taskId,
+        status: "starting",
+        started_at: startedAt,
+      },
+    ];
+    task.updated_at = new Date().toISOString();
+    return { data: store, result: attemptNumber };
+  });
+}
+
+async function updateLatestTaskAttempt(
+  taskId: string,
+  status: NonNullable<Task["attempts"]>[number]["status"],
+  note?: string,
+): Promise<void> {
+  await updateJSON<TaskStore, void>(".apex-manager/tasks.json", { tasks: [], next_id: 1 }, (store) => {
+    const task = findTask(store.tasks, taskId);
+    const currentAttempt = task?.attempts?.[task.attempts.length - 1];
+    if (task && currentAttempt) {
+      currentAttempt.status = status;
+      currentAttempt.note = note ?? currentAttempt.note;
+      if (status === "failed" || status === "blocked" || status === "completed" || status === "crashed") {
+        currentAttempt.completed_at = new Date().toISOString();
+      }
+      task.updated_at = new Date().toISOString();
+    }
+    return { data: store, result: undefined };
+  });
+}
+
 // WorkerMeta imported from ../worker/monitor.js
 
 // ── spawn ────────────────────────────────────────────────────────────
 
 async function cmdSpawn(args: string[]): Promise<void> {
-  // First positional arg (not a flag, not the value after --agent) is the task ID
-  const agentIdx = args.indexOf("--agent");
-  const agentValueIdx = agentIdx >= 0 ? agentIdx + 1 : -1;
-  const taskId = args.find((a, i) => !a.startsWith("--") && i !== agentValueIdx);
+  const taskId = firstPositional(args, new Set(["--agent", "--protocol"]));
   if (!taskId) {
-    console.error("Usage: apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--protocol <skill>] [--cross-model] [--dry-run]");
+    console.error("Usage: apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--protocol <skill>] [--cross-model] [--dry-run] [--force]");
     process.exit(1);
   }
 
@@ -110,6 +186,16 @@ async function cmdSpawn(args: string[]): Promise<void> {
   const task = findTask(store.tasks, taskId);
   if (!task) {
     console.error(`Task ${taskId} not found in .apex-manager/tasks.json`);
+    process.exit(1);
+  }
+  const force = hasFlag(args, "--force");
+  if (!force && !(task.status === "open" || task.status === "assigned")) {
+    console.error(`Cannot spawn ${taskId} from status '${task.status}'. Use --force to override.`);
+    process.exit(1);
+  }
+  const unmetDeps = (task.depends_on ?? []).filter((depId) => store.tasks.find((t) => t.id === depId)?.status !== "done");
+  if (!force && unmetDeps.length > 0) {
+    console.error(`Cannot spawn ${taskId}: unmet dependencies ${unmetDeps.join(", ")}. Use --force to override.`);
     process.exit(1);
   }
 
@@ -219,6 +305,7 @@ async function cmdSpawn(args: string[]): Promise<void> {
     agent,
     execution_mode: agentAdapter.executionMode,
     isolation_mode: isolated ? "git-worktree" : "project-root",
+    main_repo_baseline_status: isolated ? gitStatusExcludingControlPlane(projectRoot) : undefined,
     launch_verification: {
       state: "pending",
     },
@@ -237,6 +324,8 @@ async function cmdSpawn(args: string[]): Promise<void> {
     return;
   }
 
+  await updateTaskAttemptAfterSpawn(taskId, agent, meta.started_at);
+
   // 8. Create terminal window
   const slug = toSlug(task.title);
   const windowName = `${taskId}-${slug}`;
@@ -248,6 +337,23 @@ async function cmdSpawn(args: string[]): Promise<void> {
   // 9. Update meta with window handle immediately so monitoring can diagnose startup failures
   meta.window_handle = handle;
   await writeJSON(join(workersDir, "meta.json"), meta);
+
+  try {
+    await assertLaunchSurfaceAlive(taskId, terminal, handle);
+  } catch (error) {
+    meta.launch_verification = {
+      state: "failed",
+      checked_at: new Date().toISOString(),
+      note: String(error),
+    };
+    await writeJSON(join(workersDir, "meta.json"), meta);
+    await updateLatestTaskAttempt(taskId, "failed", String(error));
+    try { await terminal.close(handle); } catch {}
+    rmSync(workersDir, { recursive: true, force: true });
+    console.error(String(error));
+    process.exit(1);
+  }
+
   await recordKernelEvent({
     type: "worker.registered",
     timestamp: new Date().toISOString(),
@@ -267,14 +373,26 @@ async function cmdSpawn(args: string[]): Promise<void> {
   meta.launch_verification = verification;
   await writeJSON(join(workersDir, "meta.json"), meta);
   await recordKernelEvent({
-    type: verification.state === "verified" ? "worker.launch_verified" : "worker.launch_failed",
+    type: verification.state === "verified"
+      ? "worker.launch_verified"
+      : verification.state === "unverified"
+        ? "worker.launch_unverified"
+        : "worker.launch_failed",
     timestamp: verification.checked_at ?? new Date().toISOString(),
     worker_id: taskId,
     verification,
   });
 
+  await updateLatestTaskAttempt(
+    taskId,
+    verification.state === "verified" ? "verified" : verification.state === "unverified" ? "unverified" : "failed",
+    verification.note,
+  );
+
   if (verification.state === "verified") {
     console.log(`[smoke] ${taskId}: ${verification.action_signal}${verification.note ? `; ${verification.note}` : ""}${verification.screen_summary ? `; screen=${verification.screen_summary}` : ""}`);
+  } else if (verification.state === "unverified") {
+    console.warn(`[smoke] ${taskId}: launch unverified. ${verification.note ?? "No task activity detected yet."}${verification.screen_summary ? ` screen=${verification.screen_summary}` : ""}`);
   } else {
     console.error(`[smoke] ${taskId}: launch verification failed. ${verification.note ?? "No activity detected."}${verification.screen_summary ? ` screen=${verification.screen_summary}` : ""}`);
     process.exit(1);
@@ -289,9 +407,10 @@ async function cmdSpawn(args: string[]): Promise<void> {
 async function cmdKill(args: string[]): Promise<void> {
   const taskId = args[0];
   if (!taskId) {
-    console.error("Usage: apex-manager worker kill <task-id>");
+    console.error("Usage: apex-manager worker kill <task-id> [--force]");
     process.exit(1);
   }
+  const force = hasFlag(args, "--force");
 
   const projectRoot = process.cwd();
   const metaPath = join(projectRoot, ".apex-manager", "workers", taskId, "meta.json");
@@ -324,6 +443,18 @@ async function cmdKill(args: string[]): Promise<void> {
   // 3. Clean up worktree (skip for non-git workers)
   if (meta.branch) {
     const worktreeRel = meta.worktree_path || `.apex-manager/worktrees/${taskId}`;
+    if (!meta.branch.startsWith("apex-mgr/") || !worktreeRel.startsWith(".apex-manager/worktrees/")) {
+      console.error(`Refusing to kill ${taskId}: unsafe worker metadata paths/branch. Inspect ${metaPath} or use manual cleanup.`);
+      process.exit(1);
+    }
+    const worktreePath = resolve(projectRoot, worktreeRel);
+    if (!force && existsSync(worktreePath)) {
+      const status = spawnSync("git", ["-C", worktreePath, "status", "--porcelain"], { encoding: "utf-8" });
+      if (status.status === 0 && status.stdout.trim().length > 0) {
+        console.error(`Refusing to kill ${taskId}: worktree has uncommitted changes. Commit/stash them or rerun with --force to discard.`);
+        process.exit(1);
+      }
+    }
     spawnSync("git", ["worktree", "remove", worktreeRel, "--force"]);
     spawnSync("git", ["branch", "-D", meta.branch]);
   }
@@ -557,6 +688,10 @@ export async function cmdMerge(args: string[]): Promise<void> {
     console.error(`Cannot merge ${taskId}: worker was not isolated in a git worktree (non-git project).`);
     process.exit(1);
   }
+  if (!branch.startsWith("apex-mgr/") || !meta.worktree_path.startsWith(".apex-manager/worktrees/")) {
+    console.error(`Cannot merge ${taskId}: unsafe worker metadata paths/branch. Inspect ${metaPath}.`);
+    process.exit(1);
+  }
   const worktreePath = resolve(projectRoot, meta.worktree_path);
 
   // 3. Read task title from tasks.json
@@ -710,7 +845,8 @@ apex-manager worker — manage parallel worker agents
 Usage:
   apex-manager worker spawn <task-id> [--agent claude|codex|gemini] [--protocol <skill>] [--cross-model] [--dry-run]
                                 Spawn a worker agent for a task
-  apex-manager worker kill <task-id>    Kill worker and clean up worktree
+  apex-manager worker kill <task-id> [--force]
+                                Kill worker and clean up worktree; --force discards dirty worktrees
   apex-manager worker interrupt <task-id> Send interrupt signal to worker
   apex-manager worker tell <task-id> <message> [--wait-ack]
                                 Send a structured manager message to a worker
@@ -781,6 +917,7 @@ export async function cmdWorker(args: string[]): Promise<void> {
         const health = await checkWorkerHealth(w.meta.task_id);
         let status: string;
         if (health.completed) status = "completed";
+        else if (health.completedOrphaned) status = "completed_orphaned";
         else if (health.starting) status = "STARTING";
         else if (health.crashed) status = "CRASHED";
         else if (health.exitedWithoutResult) status = "EXITED (no result)";
@@ -819,6 +956,7 @@ export async function cmdWorker(args: string[]): Promise<void> {
       }
       let statusLabel: string;
       if (health.completed) statusLabel = "completed";
+      else if (health.completedOrphaned) statusLabel = "completed_orphaned";
       else if (health.starting) statusLabel = "STARTING";
       else if (health.crashed) statusLabel = "CRASHED";
       else if (health.exitedWithoutResult) statusLabel = "EXITED (no result)";
@@ -852,7 +990,7 @@ export async function cmdWorker(args: string[]): Promise<void> {
       if (health.screenTail) {
         lines.push("  Terminal tail:");
         for (const l of health.screenTail.split("\n").slice(-5)) {
-          lines.push(`    > ${l}`);
+          lines.push(`    > ${redactSecrets(l)}`);
         }
       }
       console.log(lines.join("\n"));
@@ -891,8 +1029,16 @@ export async function cmdWorker(args: string[]): Promise<void> {
       break;
     }
     case "help":
-    default:
       printHelp();
+      break;
+    default:
+      if (!verb) {
+        printHelp();
+      } else {
+        console.error(`Unknown worker subcommand: ${verb}`);
+        printHelp();
+        process.exit(1);
+      }
       break;
   }
 }

@@ -26,6 +26,17 @@ export interface Task {
   completion_summary?: string;
   adapter?: string;
   agent?: string;
+  requested_agent?: string;
+  actual_agent?: string;
+  attempts?: {
+    attempt: number;
+    agent: string;
+    worker_id: string;
+    status: "starting" | "unverified" | "verified" | "completed" | "failed" | "crashed" | "blocked";
+    started_at: string;
+    completed_at?: string;
+    note?: string;
+  }[];
   protocol?: string;
   branch?: string;
   category?: string;

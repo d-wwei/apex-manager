@@ -129,6 +129,15 @@ apex-manager worker spawn T1 --agent claude
 - 打开 worker 终端
 - 注入 kickoff 指令
 - 在返回成功前验证真实动作，比如 `task claim`、`status.json`、`result.json`
+- 默认拒绝未完成依赖，除非传 `--force`
+
+终端布局：
+- 如果 Plan Agent 已在 tmux 中，worker 会复用当前窗口，Plan Agent 保持左侧主 pane，worker 在右侧上下平分。
+- 如果从普通终端启动，worker 会复用同一个项目级 `apex-workers-*` tmux session，避免每个 worker 弹一个新窗口。
+
+安全默认值：
+- 默认不会给 worker CLI 自动加 `--full-auto`、`--yolo` 或 `--dangerously-skip-permissions`。
+- 如果你明确接受风险，可设置 `APEX_MANAGER_ALLOW_AUTO_APPROVAL=1`。
 
 启动 daemon：
 
@@ -189,13 +198,15 @@ apex-manager task status <task-id>
 apex-manager task claim <task-id> [--by <worker-id>]
 apex-manager task complete <task-id> [--by <worker-id>] [--summary <summary>] [--evidence <artifact-id>]
 apex-manager task block <task-id> --reason <reason> [--by <worker-id>]
+apex-manager task retry <task-id> [--agent <agent>] [--protocol <protocol>] [--reason <reason>]
 apex-manager task update <task-id> [--status <status>] [--agent <agent>] [--protocol <skill>]
 ```
 
 常用 worker 命令：
 
 ```bash
-apex-manager worker spawn <task-id> [--agent <agent>] [--protocol <skill>] [--cross-model] [--dry-run]
+apex-manager worker spawn <task-id> [--agent <agent>] [--protocol <skill>] [--cross-model] [--dry-run] [--force]
+apex-manager worker kill <task-id> [--force]
 apex-manager worker list
 apex-manager worker status <task-id>
 apex-manager worker interrupt <task-id>
@@ -205,6 +216,8 @@ apex-manager worker inject <task-id> <message> [--urgent]
 apex-manager worker merge <task-id> [--strategy local|pr|squash]
 apex-manager worker merge-all [--strategy local|pr|squash]
 apex-manager worker report
+apex-manager worker check
+apex-manager worker cost [task-id]
 apex-manager worker synthesize <task-id>
 ```
 

@@ -81,6 +81,20 @@ describe("orch lock management", () => {
     const { parseHandleFlag } = await import("../../src/commands/orch.js");
     assert.strictEqual(parseHandleFlag(["--force"]), null);
   });
+
+  it("unknown orch subcommands exit non-zero", async () => {
+    const origExit = process.exit;
+    process.exit = ((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as any;
+    try {
+      const { cmdOrch } = await import("../../src/commands/orch.js");
+      await assert.rejects(() => cmdOrch(["typo"]), /process\.exit\(1\)/);
+    } finally {
+      process.exit = origExit;
+    }
+    assert.ok(errorOutput.join("\n").includes("Unknown orch subcommand"));
+  });
 });
 
 describe("acquireLock", () => {

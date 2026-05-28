@@ -1,6 +1,6 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
-import { existsSync, mkdirSync, rmSync, readdirSync } from "fs";
+import { existsSync, mkdirSync, rmSync, readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { appendNotification, readPendingNotifications } from "../../src/daemon/notify.js";
@@ -28,6 +28,15 @@ describe("notification queue", () => {
     const files = readdirSync(dir);
     assert.strictEqual(files.length, 1);
     assert.ok(files[0].endsWith(".json"));
+  });
+
+  it("redacts secrets before persisting notifications", () => {
+    appendNotification("failed with OPENAI_API_KEY=sk-testsecret123456789");
+    const dir = join(tmpDir, ".apex-manager", "notifications");
+    const file = readdirSync(dir)[0];
+    const content = readFileSync(join(dir, file), "utf-8");
+    assert.ok(content.includes("[REDACTED]"));
+    assert.ok(!content.includes("sk-testsecret"));
   });
 
   it("readPendingNotifications returns empty when no notifications", () => {

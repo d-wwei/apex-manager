@@ -41,7 +41,7 @@ describe("cmdMsg", () => {
         priority: "normal",
         ack_required: true,
         ack_timeout_ms: 30_000,
-        body: "Please re-check it.",
+        body: "Please re-check it. OPENAI_API_KEY=sk-testsecret123456789",
         delivery_status: "delivered",
         created_at: new Date().toISOString(),
         delivered_at: new Date().toISOString(),
@@ -70,6 +70,8 @@ describe("cmdMsg", () => {
     assert.ok(output.includes("MSG-1"));
     assert.ok(output.includes("directive"));
     assert.ok(output.includes("Please re-check it."));
+    assert.ok(output.includes("[REDACTED]"));
+    assert.ok(!output.includes("sk-testsecret"));
   });
 
   it("can manually ACK a message", async () => {

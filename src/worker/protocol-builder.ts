@@ -76,6 +76,10 @@ function depsDisplay(deps: string[], lang: "zh" | "en"): string {
   return lang === "en" ? "none" : "none (无)";
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 function getLang(agent?: string): "zh" | "en" {
   if (agent) {
     const agents = loadAgentsConfig();
@@ -154,13 +158,16 @@ and return control to the Plan Agent for re-splitting.`;
 function fullBashCommunication(
   task: Task, workersDir: string, projectRoot: string, lang: "zh" | "en",
 ): string {
+  const projectRootSh = shellQuote(projectRoot);
+  const statusPathSh = shellQuote(`${workersDir}/status.json`);
+  const resultPathSh = shellQuote(`${workersDir}/result.json`);
   const claimBlock = `\
 \`\`\`bash
-cd ${projectRoot} && apex-manager task claim ${task.id} --by ${task.id}
+cd ${projectRootSh} && apex-manager task claim ${task.id} --by ${task.id}
 \`\`\``;
   const statusBlock = `\
 \`\`\`bash
-cat > ${workersDir}/status.json << 'APEX_EOF'
+cat > ${statusPathSh} << 'APEX_EOF'
 {
   "task_id": "${task.id}",
   "stage": "<current_stage>",
@@ -173,7 +180,7 @@ APEX_EOF
 
   const resultBlock = `\
 \`\`\`bash
-cat > ${workersDir}/result.json << 'APEX_EOF'
+cat > ${resultPathSh} << 'APEX_EOF'
 {
   "task_id": "${task.id}",
   "verdict": "pass",
@@ -185,15 +192,15 @@ cat > ${workersDir}/result.json << 'APEX_EOF'
 }
 APEX_EOF
 
-cd ${projectRoot} && apex-manager task complete ${task.id} --by ${task.id} --summary "<what you accomplished>"
+cd ${projectRootSh} && apex-manager task complete ${task.id} --by ${task.id} --summary "<what you accomplished>"
 
 # Optional: when you produced a reusable file artifact
-cd ${projectRoot} && apex-manager artifact submit ${task.id} --by ${task.id} --type report --path "<path-to-file>" --summary "<artifact summary>"
+cd ${projectRootSh} && apex-manager artifact submit ${task.id} --by ${task.id} --type report --path "<path-to-file>" --summary "<artifact summary>"
 \`\`\``;
 
   const blockBlock = `\
 \`\`\`bash
-cd ${projectRoot} && apex-manager task block ${task.id} --by ${task.id} --reason "<reason>"
+cd ${projectRootSh} && apex-manager task block ${task.id} --by ${task.id} --reason "<reason>"
 \`\`\``;
 
   const header = lang === "en" ? "## Communication Protocol" : "## 通信协议";
@@ -211,6 +218,7 @@ cd ${projectRoot} && apex-manager task block ${task.id} --by ${task.id} --reason
 function fileWriteCommunication(
   task: Task, workersDir: string, projectRoot: string, lang: "zh" | "en",
 ): string {
+  const projectRootSh = shellQuote(projectRoot);
   const statusJson = `{
   "task_id": "${task.id}",
   "stage": "<current_stage>",
@@ -238,7 +246,7 @@ You work in an isolated worktree. Report status to the main project:
 
 Run:
 
-- \`cd ${projectRoot} && apex-manager task claim ${task.id} --by ${task.id}\`
+- \`cd ${projectRootSh} && apex-manager task claim ${task.id} --by ${task.id}\`
 
 ### Progress Update (after each sub-task)
 
@@ -258,15 +266,15 @@ ${resultJson}
 
 Then run:
 
-- \`cd ${projectRoot} && apex-manager task complete ${task.id} --by ${task.id} --summary "<what you accomplished>"\`
+- \`cd ${projectRootSh} && apex-manager task complete ${task.id} --by ${task.id} --summary "<what you accomplished>"\`
 
 If you produced a reusable file, also run:
 
-- \`cd ${projectRoot} && apex-manager artifact submit ${task.id} --by ${task.id} --type report --path "<path-to-file>" --summary "<artifact summary>"\`
+- \`cd ${projectRootSh} && apex-manager artifact submit ${task.id} --by ${task.id} --type report --path "<path-to-file>" --summary "<artifact summary>"\`
 
 ### When Blocked
 
-Run: \`cd ${projectRoot} && apex-manager task block ${task.id} --by ${task.id} --reason "<reason>"\``;
+Run: \`cd ${projectRootSh} && apex-manager task block ${task.id} --by ${task.id} --reason "<reason>"\``;
   }
 
   return `\
@@ -278,7 +286,7 @@ Run: \`cd ${projectRoot} && apex-manager task block ${task.id} --by ${task.id} -
 
 运行:
 
-- \`cd ${projectRoot} && apex-manager task claim ${task.id} --by ${task.id}\`
+- \`cd ${projectRootSh} && apex-manager task claim ${task.id} --by ${task.id}\`
 
 ### 进度更新 (每完成一个子任务)
 
@@ -298,15 +306,15 @@ ${resultJson}
 
 然后运行:
 
-- \`cd ${projectRoot} && apex-manager task complete ${task.id} --by ${task.id} --summary "<what you accomplished>"\`
+- \`cd ${projectRootSh} && apex-manager task complete ${task.id} --by ${task.id} --summary "<what you accomplished>"\`
 
 如果你产出了可复用文件，再额外运行:
 
-- \`cd ${projectRoot} && apex-manager artifact submit ${task.id} --by ${task.id} --type report --path "<path-to-file>" --summary "<artifact summary>"\`
+- \`cd ${projectRootSh} && apex-manager artifact submit ${task.id} --by ${task.id} --type report --path "<path-to-file>" --summary "<artifact summary>"\`
 
 ### 遇到阻塞时
 
-运行: \`cd ${projectRoot} && apex-manager task block ${task.id} --by ${task.id} --reason "<reason>"\``;
+运行: \`cd ${projectRootSh} && apex-manager task block ${task.id} --by ${task.id} --reason "<reason>"\``;
 }
 
 function minimalCommunication(
@@ -439,9 +447,12 @@ function sectionDirectiveCheck(opts: ProtocolBuildOptions, lang: "zh" | "en"): s
   let consumeBlock: string;
 
   if (useBash) {
-    escalationBlock = `\`\`\`bash\ncat > ${workersDir}/escalation.json << 'APEX_EOF'\n${escalationJson}\nAPEX_EOF\n\`\`\``;
-    directiveCheckBlock = `\`\`\`bash\ntest -f ${workersDir}/directive.json && cat ${workersDir}/directive.json\n\`\`\``;
-    consumeBlock = `\`mv ${workersDir}/directive.json ${workersDir}/directive.$(date +%s).consumed.json\``;
+    const escalationPathSh = shellQuote(`${workersDir}/escalation.json`);
+    const directivePathSh = shellQuote(`${workersDir}/directive.json`);
+    const consumedPathSh = `${shellQuote(`${workersDir}/directive`)}.$(date +%s).consumed.json`;
+    escalationBlock = `\`\`\`bash\ncat > ${escalationPathSh} << 'APEX_EOF'\n${escalationJson}\nAPEX_EOF\n\`\`\``;
+    directiveCheckBlock = `\`\`\`bash\ntest -f ${directivePathSh} && cat ${directivePathSh}\n\`\`\``;
+    consumeBlock = `\`mv ${directivePathSh} ${consumedPathSh}\``;
   } else {
     escalationBlock = lang === "en"
       ? `Write the following JSON to \`${workersDir}/escalation.json\`:\n\n\`\`\`json\n${escalationJson}\n\`\`\``

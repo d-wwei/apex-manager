@@ -48,20 +48,20 @@ describe("buildStartCommand", () => {
     assert.ok(cmd.includes(baseOpts.protocolPath));
   });
 
-  it("codex: starts interactive mode with --full-auto", () => {
+  it("codex: starts interactive mode without auto-approval by default", () => {
     const cmd = BUILTIN_ADAPTERS.codex.buildStartCommand(baseOpts);
     assert.ok(cmd.includes("codex"));
-    assert.ok(cmd.includes("--full-auto"));
-    assert.ok(cmd.includes("-a never"));
-    assert.ok(cmd.includes("-s danger-full-access"));
+    assert.ok(!cmd.includes("--full-auto"));
+    assert.ok(cmd.includes("'-a' 'never'"));
+    assert.ok(cmd.includes("'-s' 'danger-full-access'"));
     // Interactive mode: no exec subcommand, no cat pipe
     assert.ok(!cmd.includes("exec"));
   });
 
-  it("gemini: starts interactive mode with --yolo", () => {
+  it("gemini: starts interactive mode without auto-approval by default", () => {
     const cmd = BUILTIN_ADAPTERS.gemini.buildStartCommand(baseOpts);
     assert.ok(cmd.includes("gemini"));
-    assert.ok(cmd.includes("--yolo"));
+    assert.ok(!cmd.includes("--yolo"));
     // Interactive mode: no -p flag
     assert.ok(!cmd.includes("-p"));
   });
@@ -77,7 +77,7 @@ describe("buildStartCommand", () => {
   it("all commands include cd to worktreePath", () => {
     for (const adapter of Object.values(BUILTIN_ADAPTERS)) {
       const cmd = adapter.buildStartCommand(baseOpts);
-      assert.ok(cmd.includes(`cd "${baseOpts.worktreePath}"`));
+      assert.ok(cmd.includes(`cd '${baseOpts.worktreePath}'`));
     }
   });
 
@@ -85,6 +85,18 @@ describe("buildStartCommand", () => {
     const opts: StartOpts = { ...baseOpts, model: "o3" };
     const cmd = BUILTIN_ADAPTERS.codex.buildStartCommand(opts);
     assert.ok(cmd.includes("o3"));
+  });
+
+  it("auto-approval flags require explicit env opt-in", () => {
+    const prev = process.env.APEX_MANAGER_ALLOW_AUTO_APPROVAL;
+    process.env.APEX_MANAGER_ALLOW_AUTO_APPROVAL = "1";
+    try {
+      const cmd = BUILTIN_ADAPTERS.codex.buildStartCommand(baseOpts);
+      assert.ok(cmd.includes("--full-auto"));
+    } finally {
+      if (prev === undefined) delete process.env.APEX_MANAGER_ALLOW_AUTO_APPROVAL;
+      else process.env.APEX_MANAGER_ALLOW_AUTO_APPROVAL = prev;
+    }
   });
 });
 
@@ -206,6 +218,34 @@ describe("resolveAdapterWithConfig", () => {
     });
     assert.ok(cmd.includes("my-claude"));
     assert.ok(cmd.includes("--custom-flag"));
+  });
+
+  it("shell-quotes config command tokens instead of executing shell metacharacters", () => {
+    const configAdapters: AdaptersMap = {
+      evil: {
+        command: "codex; touch /tmp/pwned",
+        args: ["--flag", "value with spaces"],
+        auto_approval_flag: "--danger; rm -rf /",
+      },
+    };
+    const prev = process.env.APEX_MANAGER_ALLOW_AUTO_APPROVAL;
+    process.env.APEX_MANAGER_ALLOW_AUTO_APPROVAL = "1";
+    const adapter = resolveAdapterWithConfig("evil", configAdapters);
+    let cmd: string;
+    try {
+      cmd = adapter.buildStartCommand({
+        worktreePath: "/tmp/work tree",
+        protocolPath: "/tmp/work tree/.apex-manager/workers/T1/worker-protocol.md",
+      });
+    } finally {
+      if (prev === undefined) delete process.env.APEX_MANAGER_ALLOW_AUTO_APPROVAL;
+      else process.env.APEX_MANAGER_ALLOW_AUTO_APPROVAL = prev;
+    }
+
+    assert.ok(cmd.includes("'codex; touch /tmp/pwned'"));
+    assert.ok(cmd.includes("'value with spaces'"));
+    assert.ok(cmd.includes("'--danger; rm -rf /'"));
+    assert.ok(!cmd.includes("codex; touch /tmp/pwned --flag"));
   });
 
   it("builtin returned when no config override", () => {

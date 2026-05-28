@@ -137,7 +137,6 @@ apex-manager init
 apex-manager task create "Build API" "Implement the endpoint and focused tests"
 apex-manager task create "Audit API" "Adversarial review for edge cases" --depends T1 --agent codex
 apex-manager worker spawn T1 --agent claude
-apex-manager worker spawn T2 --agent codex
 apex-manager orch start
 ```
 
@@ -145,10 +144,15 @@ apex-manager orch start
 
 - Plan Agent 定义任务和依赖
 - Worker T1 在自己的上下文里完成实现闭环
+- daemon 在 T1 完成后再启动依赖它的 T2，避免手动绕过 DAG
 - Worker T2 不接棒写功能，只作为独立评审任务包去挑问题
 - daemon 持续记录状态、消息和事件，避免团队失联
 
 如果项目是 git 仓库，每个 Worker 还能拿到独立 worktree。这样并行不是“大家一起改同一份目录赌运气”，而是有文件系统级隔离的。
+
+如果 Plan Agent 自身运行在 tmux 里，worker 会复用当前窗口：Plan Agent 保持左侧主 pane，worker 在右侧上下平分排列。若从普通终端启动，会复用一个项目级 `apex-workers-*` tmux session，而不是每个 worker 弹一个新窗口。
+
+默认不会给 worker CLI 自动加 `--full-auto`、`--yolo` 或 `--dangerously-skip-permissions`。确实需要完全自动批准时，显式设置 `APEX_MANAGER_ALLOW_AUTO_APPROVAL=1`。
 
 ## 快速开始
 

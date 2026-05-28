@@ -34,7 +34,10 @@ if [ ! -d "$SCRIPT_DIR/node_modules" ]; then
   (cd "$SCRIPT_DIR" && npm install --production)
 fi
 
-# Make CLI available
-npm link 2>/dev/null || true
+# Make CLI available from this package directory.
+if ! (cd "$SCRIPT_DIR" && npm link); then
+  echo "Failed to link apex-manager CLI. Try: cd \"$SCRIPT_DIR\" && npm link" >&2
+  exit 1
+fi
 
 echo "Done. Use /apex-manager or /Money-Come-To-Eli in your AI agent."

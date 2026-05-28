@@ -282,6 +282,58 @@ describe("cmdWorker", () => {
 
       rmSync(nonGitDir, { recursive: true, force: true });
     });
+
+    it("rejects unmet dependencies unless forced", async () => {
+      writeTasksJson(tmpDir, [
+        {
+          id: "T1",
+          title: "Dependency",
+          description: "dep",
+          status: "open",
+          depends_on: [],
+          blocked_by: [],
+          evidence: [],
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:00:00Z",
+        },
+        {
+          id: "T2",
+          title: "Dependent",
+          description: "depends on T1",
+          status: "open",
+          depends_on: ["T1"],
+          blocked_by: [],
+          evidence: [],
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:00:00Z",
+        },
+      ]);
+
+      const { cmdWorker } = await import("../../src/commands/worker.js");
+      await assert.rejects(() => cmdWorker(["spawn", "T2", "--dry-run"]), /process\.exit\(1\)/);
+
+      assert.ok(errorOutput.join("\n").includes("unmet dependencies T1"));
+    });
+
+    it("parses task id after --protocol value", async () => {
+      writeTasksJson(tmpDir, [{
+        id: "T1",
+        title: "Protocol task",
+        description: "task",
+        status: "open",
+        depends_on: [],
+        blocked_by: [],
+        evidence: [],
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      }]);
+
+      const { cmdWorker } = await import("../../src/commands/worker.js");
+      await cmdWorker(["spawn", "--protocol", "missing-skill", "T1", "--dry-run"]);
+
+      assert.ok(logOutput.join("\n").includes("Worker Agent"));
+      assert.strictEqual(errorOutput.join("\n"), "");
+    });
   });
 
   describe("spawn launch verification", () => {
@@ -365,6 +417,84 @@ esac
       assert.ok(cmuxLog.includes("send-key surface-1 enter"));
       assert.ok(cmuxLog.includes("send surface-1 Read the file .apex-manager/workers/T1/worker-protocol.md"));
     });
+
+    it("does not overwrite a task claim written during launch verification", async () => {
+      const task = {
+        id: "T1",
+        title: "Claim race task",
+        description: "Worker should claim during smoke.",
+        status: "assigned",
+        depends_on: [],
+        blocked_by: [],
+        evidence: [],
+        created_at: "2026-01-01T00:00:00Z",
+        updated_at: "2026-01-01T00:00:00Z",
+      };
+      writeTasksJson(tmpDir, [task]);
+
+      const binDir = join(tmpDir, "bin");
+      mkdirSync(binDir, { recursive: true });
+      writeFileSync(join(binDir, "codex"), `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "codex test"
+fi
+exit 0
+`);
+      writeFileSync(join(binDir, "cmux"), `#!/bin/sh
+case "$1" in
+  new-split)
+    echo "surface-1"
+    exit 0
+    ;;
+  send)
+    if printf '%s\n' "$@" | grep -q "Read the file .apex-manager/workers/T1/worker-protocol.md"; then
+      mkdir -p "$APEX_TEST_ROOT/.apex-manager/workers/T1"
+      printf '{ "task_id": "T1", "stage": "executing", "progress": "claimed", "last_activity": "2026-01-01T00:00:00Z", "errors": [] }' > "$APEX_TEST_ROOT/.apex-manager/workers/T1/status.json"
+      cat > "$APEX_TEST_ROOT/.apex-manager/tasks.json" <<'JSON'
+{
+  "tasks": [
+    {
+      "id": "T1",
+      "title": "Claim race task",
+      "description": "Worker should claim during smoke.",
+      "status": "in_progress",
+      "depends_on": [],
+      "blocked_by": [],
+      "evidence": [],
+      "claimed_by": "T1",
+      "claimed_at": "2026-01-01T00:00:01Z",
+      "created_at": "2026-01-01T00:00:00Z",
+      "updated_at": "2026-01-01T00:00:01Z"
+    }
+  ],
+  "next_id": 2
+}
+JSON
+    fi
+    exit 0
+    ;;
+  send-key|rename-tab|validate-surface|read-screen)
+    [ "$1" = "read-screen" ] && echo '$ ready'
+    exit 0
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+`);
+      chmodSync(join(binDir, "codex"), 0o755);
+      chmodSync(join(binDir, "cmux"), 0o755);
+      process.env.PATH = `${binDir}:${origPath ?? ""}`;
+      process.env.CMUX_SURFACE = "surface-plan";
+      process.env.APEX_TEST_ROOT = tmpDir;
+
+      const { cmdWorker } = await import("../../src/commands/worker.js");
+      await cmdWorker(["spawn", "T1", "--agent", "codex"]);
+
+      const store = JSON.parse(readFileSync(join(tmpDir, ".apex-manager", "tasks.json"), "utf-8"));
+      assert.strictEqual(store.tasks[0].status, "in_progress");
+      assert.strictEqual(store.tasks[0].claimed_by, "T1");
+    });
   });
 
   // --- kill with missing meta.json ---
@@ -401,6 +531,32 @@ esac
       // Worker directory should be removed
       assert.strictEqual(existsSync(join(tmpDir, ".apex-manager", "workers", "T2")), false);
     });
+
+    it("refuses to discard a dirty worktree without --force", async () => {
+      const branch = "apex-mgr/T3";
+      spawnSync("git", ["worktree", "add", ".apex-manager/worktrees/T3", "-b", branch], { cwd: tmpDir });
+      writeFileSync(join(tmpDir, ".apex-manager", "worktrees", "T3", "dirty.txt"), "dirty\n");
+      writeWorkerMeta(tmpDir, "T3", {
+        task_id: "T3",
+        window_handle: null,
+        worktree_path: ".apex-manager/worktrees/T3",
+        branch,
+        started_at: "2026-01-01T00:00:00Z",
+        agent: "claude",
+      });
+
+      const { cmdWorker } = await import("../../src/commands/worker.js");
+      await assert.rejects(() => cmdWorker(["kill", "T3"]), /process\.exit\(1\)/);
+
+      assert.ok(errorOutput.join("\n").includes("uncommitted changes"));
+      assert.strictEqual(existsSync(join(tmpDir, ".apex-manager", "workers", "T3")), true);
+    });
+  });
+
+  it("unknown worker subcommands exit non-zero", async () => {
+    const { cmdWorker } = await import("../../src/commands/worker.js");
+    await assert.rejects(() => cmdWorker(["typo"]), /process\.exit\(1\)/);
+    assert.ok(errorOutput.join("\n").includes("Unknown worker subcommand"));
   });
 
   // --- check ---

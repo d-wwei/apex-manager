@@ -8,6 +8,7 @@
 import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync, renameSync } from "fs";
 import { join } from "path";
 import type { WindowHandle, TerminalAdapter } from "../worker/terminal.js";
+import { redactSecrets } from "../utils/redact.js";
 
 const NOTIFICATIONS_DIR = ".apex-manager/notifications";
 
@@ -27,7 +28,7 @@ export async function notifyPlanAgent(
       const isIdle = screen.includes("❯") && !screen.includes("esc to interrupt");
 
       if (isIdle) {
-        await adapter.send(planAgentHandle, `[DAEMON] ${message}`);
+        await adapter.send(planAgentHandle, `[DAEMON] ${redactSecrets(message)}`);
         return;
       }
     } catch {
@@ -51,7 +52,7 @@ export function appendNotification(message: string): void {
   const filename = `${seq}-${ts}.json`;
 
   writeFileSync(join(NOTIFICATIONS_DIR, filename), JSON.stringify({
-    message,
+    message: redactSecrets(message),
     created_at: new Date().toISOString(),
     read: false,
   }, null, 2));

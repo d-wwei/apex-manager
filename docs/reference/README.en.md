@@ -129,6 +129,15 @@ What happens on spawn:
 - It opens a worker terminal session.
 - It injects the kickoff instruction.
 - It verifies real activity such as `task claim`, `status.json`, or `result.json` before considering the launch successful.
+- It rejects unmet task dependencies by default unless `--force` is provided.
+
+Terminal layout:
+- If the Plan Agent is already inside tmux, workers reuse that window: the Plan Agent stays in the left/main pane and workers are stacked on the right.
+- If launched from a regular terminal, workers reuse one project-scoped `apex-workers-*` tmux session instead of opening one terminal window per worker.
+
+Security defaults:
+- Apex Manager does not add `--full-auto`, `--yolo`, or `--dangerously-skip-permissions` by default.
+- Set `APEX_MANAGER_ALLOW_AUTO_APPROVAL=1` only when you explicitly accept that risk.
 
 Start the daemon:
 
@@ -189,13 +198,15 @@ apex-manager task status <task-id>
 apex-manager task claim <task-id> [--by <worker-id>]
 apex-manager task complete <task-id> [--by <worker-id>] [--summary <summary>] [--evidence <artifact-id>]
 apex-manager task block <task-id> --reason <reason> [--by <worker-id>]
+apex-manager task retry <task-id> [--agent <agent>] [--protocol <protocol>] [--reason <reason>]
 apex-manager task update <task-id> [--status <status>] [--agent <agent>] [--protocol <skill>]
 ```
 
 Useful worker commands:
 
 ```bash
-apex-manager worker spawn <task-id> [--agent <agent>] [--protocol <skill>] [--cross-model] [--dry-run]
+apex-manager worker spawn <task-id> [--agent <agent>] [--protocol <skill>] [--cross-model] [--dry-run] [--force]
+apex-manager worker kill <task-id> [--force]
 apex-manager worker list
 apex-manager worker status <task-id>
 apex-manager worker interrupt <task-id>
@@ -205,6 +216,8 @@ apex-manager worker inject <task-id> <message> [--urgent]
 apex-manager worker merge <task-id> [--strategy local|pr|squash]
 apex-manager worker merge-all [--strategy local|pr|squash]
 apex-manager worker report
+apex-manager worker check
+apex-manager worker cost [task-id]
 apex-manager worker synthesize <task-id>
 ```
 
